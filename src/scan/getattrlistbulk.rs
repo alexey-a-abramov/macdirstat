@@ -22,7 +22,9 @@ const ATTR_BIT_MAP_COUNT: libc::c_ushort = 5;
 // commonattr bits (from sys/attr.h)
 const ATTR_CMN_RETURNED_ATTRS: libc::attrgroup_t = 0x8000_0000;
 const ATTR_CMN_NAME: libc::attrgroup_t = 0x0000_0001;
+const ATTR_CMN_DEVID: libc::attrgroup_t = 0x0000_0002;
 const ATTR_CMN_OBJTYPE: libc::attrgroup_t = 0x0000_0008;
+const ATTR_CMN_FILEID: libc::attrgroup_t = 0x0200_0000;
 
 // fileattr bits
 const ATTR_FILE_TOTALSIZE: libc::attrgroup_t = 0x0000_0002;
@@ -35,6 +37,10 @@ pub(crate) struct DirEntry {
     pub name: Box<str>,
     pub is_dir: bool,
     pub file_size: u64,
+    /// Device ID of the containing volume. Zero if not returned.
+    pub devid: u32,
+    /// Persistent inode (APFS file ID). Zero if not returned.
+    pub fileid: u64,
 }
 
 /// Open a directory and return its fd, or -1 on error.
@@ -95,7 +101,8 @@ pub(crate) fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
 
     let mut attrlist: libc::attrlist = unsafe { std::mem::zeroed() };
     attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
-    attrlist.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+    attrlist.commonattr =
+        ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
     attrlist.fileattr = ATTR_FILE_TOTALSIZE;
 
     let mut results = Vec::new();
@@ -149,7 +156,13 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse buffer entries into DirEntry directly (no intermediate struct).
+/// Parse buffer entries into DirEntry.
+///
+/// Attributes appear in ascending bit-order with no padding between them
+/// (Apple TN getattrlist). We walk a `data_pos` cursor through the fields
+/// we requested: NAME → DEVID → OBJTYPE → FILEID (all commonattr), then
+/// TOTALSIZE (fileattr).  We check `returned_commonattr` / `returned_fileattr`
+/// so the parser degrades gracefully on non-APFS volumes.
 fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
     let buf_size = buffer.len();
     let mut offset = 0usize;
@@ -168,15 +181,19 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             offset += entry_length;
             continue;
         }
+        // attribute_set_t returned by ATTR_CMN_RETURNED_ATTRS (5 × u32 = 20 bytes)
+        let returned_commonattr = read_u32(buffer, pos);
         let returned_fileattr = read_u32(buffer, pos + 12);
 
+        // Attribute data starts after the 20-byte attribute_set_t
         let name_ref_pos = pos + 20;
         if name_ref_pos + 8 > entry_start + entry_length {
             offset += entry_length;
             continue;
         }
+
+        // ATTR_CMN_NAME — attrreference_t (8 bytes); actual string stored at end of entry
         let name_data_offset = read_i32(buffer, name_ref_pos);
-        // Safe cast: check for overflow before converting to usize
         let Some(name_abs) = (name_ref_pos as i32)
             .checked_add(name_data_offset)
             .and_then(|v| usize::try_from(v).ok())
@@ -184,7 +201,6 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             offset += entry_length;
             continue;
         };
-
         let name: Box<str> = if name_abs < entry_start + entry_length {
             let slice = &buffer[name_abs..entry_start + entry_length];
             match slice.iter().position(|&b| b == 0) {
@@ -196,11 +212,40 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             continue;
         };
 
-        let obj_type_pos = name_ref_pos + 8;
-        let obj_type = read_u32(buffer, obj_type_pos);
+        // Walk a cursor through the remaining commonattr fields
+        let mut cur = name_ref_pos + 8; // past NAME attrreference_t
 
+        // ATTR_CMN_DEVID (bit 0x02) — dev_t = i32 (4 bytes)
+        let devid = if returned_commonattr & ATTR_CMN_DEVID != 0 {
+            let v = read_u32(buffer, cur);
+            cur += 4;
+            v
+        } else {
+            0
+        };
+
+        // ATTR_CMN_OBJTYPE (bit 0x08) — u32 (4 bytes)
+        let obj_type = if returned_commonattr & ATTR_CMN_OBJTYPE != 0 {
+            let v = read_u32(buffer, cur);
+            cur += 4;
+            v
+        } else {
+            0
+        };
+
+        // ATTR_CMN_FILEID (bit 0x0200_0000) — uint64_t (8 bytes)
+        let fileid = if returned_commonattr & ATTR_CMN_FILEID != 0 {
+            let v = read_u64(buffer, cur);
+            cur += 8;
+            v
+        } else {
+            0
+        };
+
+        // fileattr section follows immediately (volattr + dirattr are empty)
+        // ATTR_FILE_TOTALSIZE — off_t = i64 (8 bytes)
         let file_size = if returned_fileattr & ATTR_FILE_TOTALSIZE != 0 {
-            read_u64(buffer, obj_type_pos + 4)
+            read_u64(buffer, cur)
         } else {
             0
         };
@@ -209,6 +254,8 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             name,
             is_dir: obj_type == VDIR,
             file_size,
+            devid,
+            fileid,
         });
         offset += entry_length;
     }
