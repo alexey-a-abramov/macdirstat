@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
 
 use eframe::egui;
@@ -6,17 +7,25 @@ use eframe::egui;
 use crate::format_size;
 use crate::model::color::ColorMap;
 use crate::model::tree::{FileTree, TreePath};
+use crate::settings::Settings;
 use crate::ui;
 
 pub struct App {
     state: AppState,
+    settings: Settings,
+    settings_open: bool,
     #[cfg(target_os = "macos")]
     about_configured: bool,
 }
 
 enum AppState {
     WaitingForPicker { frames: u8 },
-    Scanning { path: PathBuf, start_time: Instant },
+    Scanning {
+        path: PathBuf,
+        start_time: Instant,
+        receiver: std::sync::mpsc::Receiver<FileTree>,
+        progress: Arc<AtomicU64>,
+    },
     Loaded(Box<LoadedState>),
 }
 
@@ -28,12 +37,15 @@ struct LoadedState {
     cached_layout_rect: Option<egui::Rect>,
     treemap_texture: Option<egui::TextureHandle>,
     pending_scan: Option<PathBuf>,
+    open_settings_requested: bool,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
         let mut app = Self {
             state: AppState::WaitingForPicker { frames: 2 },
+            settings: Settings::load(),
+            settings_open: false,
             #[cfg(target_os = "macos")]
             about_configured: false,
         };
@@ -44,9 +56,22 @@ impl App {
     }
 
     fn start_scan(&mut self, path: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress = Arc::new(AtomicU64::new(0));
+        let progress_clone = Arc::clone(&progress);
+        let path_clone = path.clone();
+        let excluded = self.settings.excluded_paths();
+
+        std::thread::spawn(move || {
+            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone);
+            let _ = tx.send(tree);
+        });
+
         self.state = AppState::Scanning {
             path,
             start_time: Instant::now(),
+            receiver: rx,
+            progress,
         };
     }
 }
@@ -65,14 +90,14 @@ impl eframe::App for App {
             configure_about_panel_text();
         }
 
-        // Scanning is synchronous — blocks the UI thread
-        if let AppState::Scanning {
-            ref path,
-            start_time,
-        } = self.state
-        {
-            let tree = FileTree::scan(path);
-            let scan_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        // Check whether the background scan thread has finished.
+        let mut completed: Option<(FileTree, f64)> = None;
+        if let AppState::Scanning { ref receiver, start_time, .. } = self.state {
+            if let Ok(tree) = receiver.try_recv() {
+                completed = Some((tree, start_time.elapsed().as_secs_f64() * 1000.0));
+            }
+        }
+        if let Some((tree, scan_time_ms)) = completed {
             let color_map = ColorMap::from_extensions(&tree.extensions);
             self.state = AppState::Loaded(Box::new(LoadedState {
                 tree,
@@ -82,6 +107,7 @@ impl eframe::App for App {
                 cached_layout_rect: None,
                 treemap_texture: None,
                 pending_scan: None,
+                open_settings_requested: false,
             }));
         }
 
@@ -104,12 +130,10 @@ impl eframe::App for App {
                 }
                 // frames == u8::MAX: dialog was dismissed, waiting for close
             }
-            AppState::Scanning { .. } => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.heading("Scanning...");
-                    });
-                });
+            AppState::Scanning { path, progress, .. } => {
+                let count = progress.load(Ordering::Relaxed);
+                show_scanning_panes(ctx, path, count, &mut self.settings_open);
+                ctx.request_repaint();
             }
             AppState::Loaded(loaded) => {
                 handle_delete(loaded, ctx);
@@ -117,17 +141,70 @@ impl eframe::App for App {
             }
         }
 
-        // Handle ⌘O and pending scans from breadcrumb menu (outside the match
-        // to avoid borrow conflicts with self.state).
+        // Handle ⌘O, ⌘R, pending scans, and settings_open flag — outside the match
+        // to avoid borrow conflicts with self.state.
         if let AppState::Loaded(loaded) = &mut self.state {
             let cmd_o = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+            let cmd_r = ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.command);
+            if loaded.open_settings_requested {
+                loaded.open_settings_requested = false;
+                self.settings_open = true;
+            }
             let path = if cmd_o {
                 pick_folder()
+            } else if cmd_r {
+                Some(PathBuf::from(&loaded.tree.root_path))
             } else {
                 loaded.pending_scan.take()
             };
             if let Some(path) = path {
                 self.start_scan(path);
+            }
+        }
+
+        // Settings window
+        if self.settings_open {
+            let mut open = self.settings_open;
+            egui::Window::new("Settings")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_min_width(340.0);
+                    ui.heading("Scan Settings");
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.settings.ignore_cloud_storage,
+                        "Ignore cloud storage",
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Excludes from scans:\n  \u{2022} ~/Library/CloudStorage  (Google Drive, OneDrive\u{2026})\n  \u{2022} ~/Library/Mobile\u{202F}Documents  (iCloud)",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.settings = Settings::load();
+                            self.settings_open = false;
+                        }
+                        if ui.button("Apply & Rescan").clicked() {
+                            self.settings.save();
+                            self.settings_open = false;
+                            if let AppState::Loaded(loaded) = &mut self.state {
+                                loaded.pending_scan =
+                                    Some(PathBuf::from(&loaded.tree.root_path));
+                            }
+                        }
+                    });
+                });
+            if !open {
+                self.settings_open = false;
             }
         }
     }
@@ -188,12 +265,23 @@ impl LoadedState {
                     {
                         reveal_in_finder(&fs_path);
                     }
+
+                    ui.separator();
+
+                    if ui.button("\u{21BA} Rescan").on_hover_text("\u{2318}R").clicked() {
+                        self.pending_scan = Some(PathBuf::from(&self.tree.root_path));
+                    }
+
+                    if ui.button("\u{2699}\u{FE0F}").on_hover_text("Settings").clicked() {
+                        self.open_settings_requested = true;
+                    }
                 });
             });
         });
     }
 
     fn show_tree_panel(&mut self, ctx: &egui::Context) {
+        let mut finder_action = None;
         egui::SidePanel::left("tree_view")
             .default_width(300.0)
             .min_width(250.0)
@@ -203,11 +291,13 @@ impl LoadedState {
                     .inner_margin(egui::Margin::from(8)),
             )
             .show(ctx, |ui| {
-                ui::tree_view::show(ui, &self.tree.root, &mut self.selected);
+                finder_action = ui::tree_view::show(ui, &self.tree.root, &mut self.selected);
             });
+        handle_context_action(self, ctx, finder_action);
     }
 
     fn show_central_panel(&mut self, ctx: &egui::Context) {
+        let mut finder_action = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut new_scan_path: Option<PathBuf> = None;
             self.show_breadcrumb(ui, &mut new_scan_path);
@@ -216,7 +306,7 @@ impl LoadedState {
                 self.pending_scan = Some(path);
             }
 
-            ui::treemap_view::show(
+            finder_action = ui::treemap_view::show(
                 ui,
                 &mut self.tree,
                 &mut self.selected,
@@ -225,6 +315,7 @@ impl LoadedState {
                 &mut self.treemap_texture,
             );
         });
+        handle_context_action(self, ctx, finder_action);
     }
 
     fn show_breadcrumb(&self, ui: &mut egui::Ui, new_scan_path: &mut Option<PathBuf>) {
@@ -397,6 +488,62 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
 }
 
 /// Render the three-pane layout with empty panels (same IDs as Loaded state).
+fn show_scanning_panes(
+    ctx: &egui::Context,
+    path: &std::path::Path,
+    file_count: u64,
+    settings_open: &mut bool,
+) {
+    egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} files discovered\u{2026}",
+                format_file_count(file_count)
+            ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("\u{2699}\u{FE0F}").on_hover_text("Settings").clicked() {
+                    *settings_open = true;
+                }
+            });
+        });
+    });
+
+    egui::SidePanel::left("tree_view")
+        .default_width(300.0)
+        .min_width(250.0)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::side_top_panel(ctx.style().as_ref()).inner_margin(egui::Margin::from(8)),
+        )
+        .show(ctx, |ui| {
+            ui::tree_view::show_branding(ui);
+        });
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let folder_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| path.to_str().unwrap_or(""));
+        let rect = ui.available_rect_before_wrap();
+        let cx = rect.center().x;
+        let cy = rect.center().y;
+        ui.painter().text(
+            egui::pos2(cx, cy - 14.0),
+            egui::Align2::CENTER_CENTER,
+            format!("Scanning \u{201C}{folder_name}\u{201D}\u{2026}"),
+            egui::FontId::proportional(18.0),
+            ui.visuals().text_color(),
+        );
+        ui.painter().text(
+            egui::pos2(cx, cy + 14.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{} files discovered", format_file_count(file_count)),
+            egui::FontId::proportional(14.0),
+            egui::Color32::GRAY,
+        );
+    });
+}
+
 fn show_empty_panes(ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |_ui| {});
 
@@ -441,6 +588,44 @@ fn next_selection_after_delete(
     }
 }
 
+fn handle_context_action(
+    loaded: &mut LoadedState,
+    ctx: &egui::Context,
+    action: Option<(TreePath, ui::ContextAction)>,
+) {
+    let Some((path, action)) = action else { return };
+    match action {
+        ui::ContextAction::Delete => {
+            if let Some(target) = DeleteTarget::from_selection(&loaded.tree, &path) {
+                if native_confirm_delete(
+                    target.name(),
+                    target.size,
+                    &target.fs_path,
+                    target.is_dir,
+                ) {
+                    execute_delete(loaded, &target);
+                }
+            }
+        }
+        ui::ContextAction::CopyPath => {
+            if let Some(fs_path) = loaded.tree.build_fs_path(&path) {
+                ctx.copy_text(fs_path.to_string_lossy().into_owned());
+            }
+        }
+        _ => {
+            if let Some(fs_path) = loaded.tree.build_fs_path(&path) {
+                let is_dir = loaded
+                    .tree
+                    .root
+                    .resolve_path(&path)
+                    .map(|n| n.is_dir)
+                    .unwrap_or(false);
+                handle_finder_action(action, &fs_path, is_dir);
+            }
+        }
+    }
+}
+
 fn reveal_in_finder(path: &std::path::Path) {
     if let Err(e) = std::process::Command::new("open")
         .arg("-R")
@@ -448,6 +633,27 @@ fn reveal_in_finder(path: &std::path::Path) {
         .spawn()
     {
         eprintln!("Failed to reveal {:?} in Finder: {}", path, e);
+    }
+}
+
+fn open_in_finder(path: &std::path::Path) {
+    if let Err(e) = std::process::Command::new("open").arg(path).spawn() {
+        eprintln!("Failed to open {:?} in Finder: {}", path, e);
+    }
+}
+
+fn handle_finder_action(action: ui::ContextAction, path: &std::path::Path, is_dir: bool) {
+    match action {
+        ui::ContextAction::OpenInFinder => {
+            if is_dir {
+                open_in_finder(path);
+            } else {
+                // For files, "Open in Finder" reveals the file in its parent folder
+                reveal_in_finder(path);
+            }
+        }
+        ui::ContextAction::RevealInFinder => reveal_in_finder(path),
+        ui::ContextAction::CopyPath | ui::ContextAction::Delete => {}
     }
 }
 

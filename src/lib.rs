@@ -3,6 +3,7 @@ pub mod model;
 #[cfg(target_os = "macos")]
 pub(crate) mod objc_ffi;
 pub mod scan;
+pub mod settings;
 pub mod ui;
 
 /// Format a byte count as a human-readable string (e.g., "1.2 GB", "340.5 MB").

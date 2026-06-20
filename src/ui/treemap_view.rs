@@ -1,9 +1,12 @@
+use std::cell::Cell;
+
 use egui::{Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions, pos2};
 use treemap::{MapItem, Mappable, TreemapLayout};
 
 use crate::format_size;
 use crate::model::color::{ColorMap, PALETTE_BRIGHTNESS};
 use crate::model::tree::{FileNode, FileTree, TreePath};
+use super::ContextAction;
 
 /// Cushion surface coefficients: [a_x, a_y, c_x, c_y]
 /// z(x,y) = a_x*x^2 + a_y*y^2 + c_x*x + c_y*y
@@ -31,13 +34,13 @@ pub fn show(
     color_map: &ColorMap,
     cached_layout_rect: &mut Option<Rect>,
     treemap_texture: &mut Option<TextureHandle>,
-) {
+) -> Option<(TreePath, ContextAction)> {
     let available = ui.available_size();
     let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
     let canvas = response.rect;
 
     if canvas.width() < 2.0 || canvas.height() < 2.0 {
-        return;
+        return None;
     }
 
     let w = canvas.width();
@@ -138,6 +141,53 @@ pub fn show(
             );
         }
     }
+
+    // Context menu on right-click: persist the right-clicked node path across frames
+    // using egui memory, since the popup stays open across multiple frames.
+    let ctx_node_id = response.id.with("ctx_node");
+    if response.secondary_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let mut path = Vec::new();
+            if find_node_at(&tree.root, pos, &mut path) {
+                ui.ctx().data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, path));
+            } else {
+                ui.ctx().data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, Vec::new()));
+            }
+        }
+    }
+    let ctx_node: Option<Vec<usize>> = ui.ctx().data(|d| {
+        d.get_temp::<Vec<usize>>(ctx_node_id).filter(|p| !p.is_empty())
+    });
+
+    let action_cell: Cell<Option<ContextAction>> = Cell::new(None);
+    response.context_menu(|ui| {
+        if ctx_node.is_some() {
+            if ui.button("Open in Finder").clicked() {
+                action_cell.set(Some(ContextAction::OpenInFinder));
+                ui.close_menu();
+            }
+            if ui.button("Reveal in Finder").clicked() {
+                action_cell.set(Some(ContextAction::RevealInFinder));
+                ui.close_menu();
+            }
+            if ui.button("Copy Path").clicked() {
+                action_cell.set(Some(ContextAction::CopyPath));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Delete\u{2026}").clicked() {
+                action_cell.set(Some(ContextAction::Delete));
+                ui.close_menu();
+            }
+        }
+    });
+
+    if let Some(action) = action_cell.into_inner() {
+        if let Some(path) = ctx_node {
+            return Some((path, action));
+        }
+    }
+    None
 }
 
 fn layout_node(node: &mut FileNode, bounds: treemap::Rect) {

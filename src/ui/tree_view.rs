@@ -4,6 +4,7 @@ use egui::{Color32, Id, Rect, RichText, pos2, vec2};
 
 use crate::format_size;
 use crate::model::tree::{FileNode, TreePath};
+use super::ContextAction;
 
 const MAX_RENDERED_ITEMS: usize = 2000;
 const SIZE_COL_WIDTH: f32 = 55.0;
@@ -29,7 +30,7 @@ pub fn show_branding(ui: &mut egui::Ui) {
     });
 }
 
-pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>) {
+pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>) -> Option<(TreePath, ContextAction)> {
     show_branding(ui);
     ui.add_space(4.0);
 
@@ -82,6 +83,7 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
         alt_row_color,
         scroll_right: 0.0,
         frame_left: 0.0,
+        context_action: None,
     };
 
     let available_height = ui.available_height();
@@ -124,6 +126,8 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
             }
         }
     }
+
+    ctx.context_action
 }
 
 /// Open all ancestor CollapsingState headers for the given path
@@ -149,6 +153,7 @@ struct TreeCtx<'a> {
     alt_row_color: Color32,
     scroll_right: f32,
     frame_left: f32,
+    context_action: Option<(TreePath, ContextAction)>,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -303,6 +308,7 @@ impl<'a> TreeCtx<'a> {
             let is_sel = is_selected;
             let name_owned = display_name.to_string();
             let name_x = Cell::new(0.0f32);
+            let action_cell: Cell<Option<ContextAction>> = Cell::new(None);
 
             state
                 .show_header(ui, |ui| {
@@ -320,6 +326,25 @@ impl<'a> TreeCtx<'a> {
                     if resp.clicked() {
                         *self.selected = Some(path_clone.clone());
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("Open in Finder").clicked() {
+                            action_cell.set(Some(ContextAction::OpenInFinder));
+                            ui.close_menu();
+                        }
+                        if ui.button("Reveal in Finder").clicked() {
+                            action_cell.set(Some(ContextAction::RevealInFinder));
+                            ui.close_menu();
+                        }
+                        if ui.button("Copy Path").clicked() {
+                            action_cell.set(Some(ContextAction::CopyPath));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Delete\u{2026}").clicked() {
+                            action_cell.set(Some(ContextAction::Delete));
+                            ui.close_menu();
+                        }
+                    });
                 })
                 .body(|ui| {
                     let remaining = node.children.len();
@@ -343,10 +368,15 @@ impl<'a> TreeCtx<'a> {
                 is_sel,
             );
             self.paint_size(ui, header_row_y + 10.0, node.size, is_sel);
+
+            if let Some(action) = action_cell.into_inner() {
+                self.context_action = Some((path_clone, action));
+            }
         } else {
             self.paint_row_bg(ui, is_selected);
 
             let name_x = Cell::new(0.0f32);
+            let action_cell: Cell<Option<ContextAction>> = Cell::new(None);
 
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
@@ -367,7 +397,26 @@ impl<'a> TreeCtx<'a> {
                 if resp.clicked() {
                     *self.selected = Some(self.current_path.clone());
                 }
+                resp.context_menu(|ui| {
+                    if ui.button("Open in Finder").clicked() {
+                        action_cell.set(Some(ContextAction::OpenInFinder));
+                        ui.close_menu();
+                    }
+                    if ui.button("Reveal in Finder").clicked() {
+                        action_cell.set(Some(ContextAction::RevealInFinder));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Delete\u{2026}").clicked() {
+                        action_cell.set(Some(ContextAction::Delete));
+                        ui.close_menu();
+                    }
+                });
             });
+
+            if let Some(action) = action_cell.into_inner() {
+                self.context_action = Some((self.current_path.clone(), action));
+            }
 
             // Paint name with foreground fade and size
             self.paint_name_faded(
