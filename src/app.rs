@@ -62,8 +62,9 @@ impl App {
         let path_clone = path.clone();
         let excluded = self.settings.excluded_paths();
 
+        let skip_duplicates = self.settings.skip_duplicate_inodes;
         std::thread::spawn(move || {
-            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone);
+            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone, skip_duplicates);
             let _ = tx.send(tree);
         });
 
@@ -182,6 +183,19 @@ impl eframe::App for App {
                     ui.label(
                         egui::RichText::new(
                             "Excludes from scans:\n  \u{2022} ~/Library/CloudStorage  (Google Drive, OneDrive\u{2026})\n  \u{2022} ~/Library/Mobile\u{202F}Documents  (iCloud)",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut self.settings.skip_duplicate_inodes,
+                        "Skip duplicate inodes",
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Avoids double-counting hardlinks and macOS firmlinks\n(e.g. /Users \u{2194} /System/Volumes/Data/Users)",
                         )
                         .small()
                         .color(egui::Color32::GRAY),

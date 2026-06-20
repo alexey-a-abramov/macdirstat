@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -77,13 +77,60 @@ pub struct FileTree {
     pub extensions: Vec<(Box<str>, u64)>,
 }
 
+/// Scan-wide options and mutable state shared across threads.
+struct ScanCtx {
+    skip_duplicates: bool,
+    /// (devid, ino) of every directory we have opened so far.
+    seen_dirs: Mutex<HashSet<(u32, u64)>>,
+    /// (devid, fileid) of every regular file we have counted so far.
+    seen_files: Mutex<HashSet<(u32, u64)>>,
+}
+
+impl ScanCtx {
+    fn new(skip_duplicates: bool) -> Self {
+        Self {
+            skip_duplicates,
+            seen_dirs: Mutex::new(HashSet::new()),
+            seen_files: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Register a directory fd. Returns `false` if this (devid, ino) was already seen.
+    fn try_register_dir(&self, fd: libc::c_int) -> bool {
+        if !self.skip_duplicates || fd < 0 {
+            return true;
+        }
+        let mut s: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut s) } != 0 {
+            return true; // fstat failed — allow traversal
+        }
+        let key = (s.st_dev as u32, s.st_ino as u64);
+        self.seen_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
+    }
+
+    /// Register a file inode. Returns `false` if this (devid, fileid) was already seen.
+    fn try_register_file(&self, devid: u32, fileid: u64) -> bool {
+        if !self.skip_duplicates || fileid == 0 {
+            return true;
+        }
+        self.seen_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((devid, fileid))
+    }
+}
+
 impl FileTree {
     /// Build a file tree by scanning the given path using getattrlistbulk.
     /// Directories whose absolute path exactly matches an entry in `excluded` are skipped.
     /// `progress` is incremented once per file discovered (for live UI updates).
-    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>) -> Self {
+    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, skip_duplicates: bool) -> Self {
         let ext_map = Mutex::new(HashMap::<Box<str>, u64>::new());
-        let root_node = build_root_node(root, excluded, progress);
+        let ctx = Arc::new(ScanCtx::new(skip_duplicates));
+        let root_node = build_root_node(root, excluded, progress, &ctx);
 
         // Drain the main thread's local ext map
         LOCAL_EXT_MAP.with(|m| {
@@ -206,7 +253,7 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
     }
 }
 
-fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>) -> FileNode {
+fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, ctx: &Arc<ScanCtx>) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
     if fd < 0 {
         eprintln!(
@@ -214,9 +261,10 @@ fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>)
             path
         );
     }
+    ctx.try_register_dir(fd); // register root so firmlink twins are skipped
     let name: Box<str> = path.display().to_string().into();
     let abs_path = path.to_owned();
-    let node = build_node_fd(fd, name, Some(abs_path), excluded, progress);
+    let node = build_node_fd(fd, name, Some(abs_path), excluded, progress, ctx);
     getattrlistbulk::close_dir(fd);
     node
 }
@@ -230,6 +278,7 @@ fn build_node_fd(
     current_abs_path: Option<PathBuf>,
     excluded: &[PathBuf],
     progress: &Arc<AtomicU64>,
+    ctx: &Arc<ScanCtx>,
 ) -> FileNode {
     use rayon::prelude::*;
 
@@ -252,6 +301,10 @@ fn build_node_fd(
             }
             dir_names.push(entry);
         } else {
+            // Skip duplicate file inodes (e.g. hardlinks counted twice)
+            if !ctx.try_register_file(entry.devid, entry.fileid) {
+                continue;
+            }
             total_size += entry.file_size;
             total_file_count += 1;
             progress.fetch_add(1, Ordering::Relaxed);
@@ -280,8 +333,21 @@ fn build_node_fd(
     // Recurse into subdirectories — use openat() relative to parent fd
     let build_child = |entry: &&DirEntry| -> FileNode {
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
+        // Skip if we've already visited this inode (firmlinks, bind-mounts)
+        if !ctx.try_register_dir(child_fd) {
+            getattrlistbulk::close_dir(child_fd);
+            return FileNode {
+                name: entry.name.clone(),
+                size: 0,
+                is_dir: true,
+                children: Box::new([]),
+                rect: treemap::Rect::new(),
+                file_count: 0,
+                dir_count: 1,
+            };
+        }
         let child_abs = current_abs_path.as_ref().map(|p| p.join(&*entry.name));
-        let node = build_node_fd(child_fd, entry.name.clone(), child_abs, excluded, progress);
+        let node = build_node_fd(child_fd, entry.name.clone(), child_abs, excluded, progress, ctx);
         getattrlistbulk::close_dir(child_fd);
         node
     };
