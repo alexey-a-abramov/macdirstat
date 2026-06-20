@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::scan::getattrlistbulk::{self, DirEntry};
 
@@ -76,9 +79,11 @@ pub struct FileTree {
 
 impl FileTree {
     /// Build a file tree by scanning the given path using getattrlistbulk.
-    pub fn scan(root: &Path) -> Self {
+    /// Directories whose absolute path exactly matches an entry in `excluded` are skipped.
+    /// `progress` is incremented once per file discovered (for live UI updates).
+    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>) -> Self {
         let ext_map = Mutex::new(HashMap::<Box<str>, u64>::new());
-        let root_node = build_root_node(root);
+        let root_node = build_root_node(root, excluded, progress);
 
         // Drain the main thread's local ext map
         LOCAL_EXT_MAP.with(|m| {
@@ -201,7 +206,7 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
     }
 }
 
-fn build_root_node(path: &Path) -> FileNode {
+fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
     if fd < 0 {
         eprintln!(
@@ -210,14 +215,22 @@ fn build_root_node(path: &Path) -> FileNode {
         );
     }
     let name: Box<str> = path.display().to_string().into();
-    let node = build_node_fd(fd, name);
+    let abs_path = path.to_owned();
+    let node = build_node_fd(fd, name, Some(abs_path), excluded, progress);
     getattrlistbulk::close_dir(fd);
     node
 }
 
 /// Build a FileNode from an already-opened directory fd.
 /// `node_name` is the display name for this node.
-fn build_node_fd(parent_fd: libc::c_int, node_name: Box<str>) -> FileNode {
+/// `current_abs_path` is the absolute path of the directory, used to skip excluded children.
+fn build_node_fd(
+    parent_fd: libc::c_int,
+    node_name: Box<str>,
+    current_abs_path: Option<PathBuf>,
+    excluded: &[PathBuf],
+    progress: &Arc<AtomicU64>,
+) -> FileNode {
     use rayon::prelude::*;
 
     let entries = getattrlistbulk::scan_dir_entries_fd(parent_fd);
@@ -230,10 +243,18 @@ fn build_node_fd(parent_fd: libc::c_int, node_name: Box<str>) -> FileNode {
 
     for entry in &entries {
         if entry.is_dir {
+            // Skip directories whose absolute path is in the exclusion list
+            if let Some(ref parent) = current_abs_path {
+                let child_path = parent.join(&*entry.name);
+                if excluded.iter().any(|excl| child_path == *excl) {
+                    continue;
+                }
+            }
             dir_names.push(entry);
         } else {
             total_size += entry.file_size;
             total_file_count += 1;
+            progress.fetch_add(1, Ordering::Relaxed);
             LOCAL_EXT_MAP.with(|m| {
                 let mut map = m.borrow_mut();
                 let ext = raw_extension(&entry.name);
@@ -259,7 +280,8 @@ fn build_node_fd(parent_fd: libc::c_int, node_name: Box<str>) -> FileNode {
     // Recurse into subdirectories — use openat() relative to parent fd
     let build_child = |entry: &&DirEntry| -> FileNode {
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
-        let node = build_node_fd(child_fd, entry.name.clone());
+        let child_abs = current_abs_path.as_ref().map(|p| p.join(&*entry.name));
+        let node = build_node_fd(child_fd, entry.name.clone(), child_abs, excluded, progress);
         getattrlistbulk::close_dir(child_fd);
         node
     };
