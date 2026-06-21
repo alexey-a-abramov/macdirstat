@@ -76,6 +76,72 @@ impl App {
             progress,
         };
     }
+
+    /// Render the top menu bar. Present in every state so Settings and folder
+    /// actions are always reachable.
+    fn show_menu_bar(&mut self, ctx: &egui::Context) {
+        let mut open_folder = false;
+        let mut rescan = false;
+        let mut quit = false;
+        let mut open_settings = false;
+
+        let can_rescan = matches!(self.state, AppState::Loaded(_));
+
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open Folder\u{2026}").clicked() {
+                        open_folder = true;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(can_rescan, egui::Button::new("Rescan"))
+                        .clicked()
+                    {
+                        rescan = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        quit = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Settings\u{2026}").clicked() {
+                        open_settings = true;
+                        ui.close_menu();
+                    }
+                });
+                // A direct, hard-to-miss entry point as well.
+                if ui
+                    .button("\u{2699}\u{FE0F} Settings")
+                    .on_hover_text("\u{2318},")
+                    .clicked()
+                {
+                    open_settings = true;
+                }
+            });
+        });
+
+        if open_settings {
+            self.settings_open = true;
+        }
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if open_folder {
+            if let Some(path) = pick_folder() {
+                self.start_scan(path);
+            }
+        }
+        if rescan {
+            if let AppState::Loaded(loaded) = &self.state {
+                let path = PathBuf::from(&loaded.tree.root_path);
+                self.start_scan(path);
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -90,6 +156,15 @@ impl eframe::App for App {
         if !self.about_configured {
             self.about_configured = true;
             configure_about_panel_text();
+        }
+
+        // Top menu bar — registered before the per-state panels so the central
+        // panel is always added last.
+        self.show_menu_bar(ctx);
+
+        // ⌘, opens Settings (macOS convention), in any state.
+        if ctx.input(|i| i.key_pressed(egui::Key::Comma) && i.modifiers.command) {
+            self.settings_open = true;
         }
 
         // Check whether the background scan thread has finished.
