@@ -7,6 +7,11 @@ pub struct Settings {
     /// Prevents double-counting hardlinks and macOS firmlinks (e.g. /Users ↔
     /// /System/Volumes/Data/Users).  Default: true.
     pub skip_duplicate_inodes: bool,
+    /// When true, files smaller than `min_file_size_mb` MiB are ignored during
+    /// scanning. Dramatically reduces scan time on directories with many small
+    /// files. Default: true, 25 MiB.
+    pub optimization_mode: bool,
+    pub min_file_size_mb: u64,
 }
 
 impl Default for Settings {
@@ -14,6 +19,8 @@ impl Default for Settings {
         Self {
             ignore_cloud_storage: true,
             skip_duplicate_inodes: true,
+            optimization_mode: true,
+            min_file_size_mb: 25,
         }
     }
 }
@@ -34,8 +41,11 @@ impl Settings {
         let _ = std::fs::write(
             path,
             format!(
-                "ignore_cloud_storage={}\nskip_duplicate_inodes={}\n",
-                self.ignore_cloud_storage, self.skip_duplicate_inodes
+                "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\n",
+                self.ignore_cloud_storage,
+                self.skip_duplicate_inodes,
+                self.optimization_mode,
+                self.min_file_size_mb,
             ),
         );
     }
@@ -47,9 +57,25 @@ impl Settings {
                 s.ignore_cloud_storage = val.trim() == "true";
             } else if let Some(val) = line.strip_prefix("skip_duplicate_inodes=") {
                 s.skip_duplicate_inodes = val.trim() == "true";
+            } else if let Some(val) = line.strip_prefix("optimization_mode=") {
+                s.optimization_mode = val.trim() == "true";
+            } else if let Some(val) = line.strip_prefix("min_file_size_mb=") {
+                if let Ok(n) = val.trim().parse::<u64>() {
+                    s.min_file_size_mb = n;
+                }
             }
         }
         s
+    }
+
+    /// Returns the minimum file size in bytes for the optimization filter,
+    /// or 0 if optimization mode is disabled.
+    pub fn min_file_size_bytes(&self) -> u64 {
+        if self.optimization_mode {
+            self.min_file_size_mb * 1024 * 1024
+        } else {
+            0
+        }
     }
 
     pub fn excluded_paths(&self) -> Vec<PathBuf> {
