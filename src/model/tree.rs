@@ -259,8 +259,8 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
 fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, ctx: &Arc<ScanCtx>) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
     if fd < 0 {
-        eprintln!(
-            "Warning: could not open directory {:?} (permission denied or not found)",
+        log::warn!(
+            "Could not open directory {:?} (permission denied or not found)",
             path
         );
     }

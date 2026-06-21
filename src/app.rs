@@ -64,6 +64,13 @@ impl App {
 
         let skip_duplicates = self.settings.skip_duplicate_inodes;
         let min_file_size_bytes = self.settings.min_file_size_bytes();
+        log::info!(
+            "Scan started: {} (skip_duplicates={}, min_file_size={} MB, {} excluded paths)",
+            path.display(),
+            skip_duplicates,
+            min_file_size_bytes / (1024 * 1024),
+            excluded.len(),
+        );
         std::thread::spawn(move || {
             let tree = FileTree::scan(&path_clone, &excluded, &progress_clone, skip_duplicates, min_file_size_bytes);
             let _ = tx.send(tree);
@@ -175,6 +182,14 @@ impl eframe::App for App {
             }
         }
         if let Some((tree, scan_time_ms)) = completed {
+            log::info!(
+                "Scan complete: {} — {} files, {} dirs, {} in {:.0}ms",
+                tree.root_path,
+                tree.root.file_count,
+                tree.root.dir_count,
+                format_size(tree.root.size),
+                scan_time_ms,
+            );
             let color_map = ColorMap::from_extensions(&tree.extensions);
             self.state = AppState::Loaded(Box::new(LoadedState {
                 tree,
@@ -601,7 +616,7 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
             loaded.treemap_texture = None;
         }
         Err(e) => {
-            eprintln!("Failed to delete {:?}: {}", target.fs_path, e);
+            log::error!("Failed to delete {:?}: {}", target.fs_path, e);
         }
     }
 }
@@ -751,13 +766,13 @@ fn reveal_in_finder(path: &std::path::Path) {
         .arg(path)
         .spawn()
     {
-        eprintln!("Failed to reveal {:?} in Finder: {}", path, e);
+        log::warn!("Failed to reveal {:?} in Finder: {}", path, e);
     }
 }
 
 fn open_in_finder(path: &std::path::Path) {
     if let Err(e) = std::process::Command::new("open").arg(path).spawn() {
-        eprintln!("Failed to open {:?} in Finder: {}", path, e);
+        log::warn!("Failed to open {:?} in Finder: {}", path, e);
     }
 }
 

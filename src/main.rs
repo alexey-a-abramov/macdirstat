@@ -1,4 +1,12 @@
 fn main() -> eframe::Result<()> {
+    macdirstat::logging::init();
+    macdirstat::logging::install_panic_hook();
+    log::info!(
+        "MacDirStat {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+
     let initial_path = std::env::args().nth(1);
 
     let icon = load_icon();
