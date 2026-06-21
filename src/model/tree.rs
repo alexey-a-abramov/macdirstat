@@ -337,32 +337,25 @@ fn build_node_fd(
         }
     }
 
-    // Recurse into subdirectories — use openat() relative to parent fd
-    let build_child = |entry: &&DirEntry| -> FileNode {
+    // Recurse into subdirectories — use openat() relative to parent fd.
+    // Returns None for directories we've already visited (firmlinks, bind-mounts)
+    // so the duplicate is dropped entirely rather than shown as an empty node.
+    let build_child = |entry: &&DirEntry| -> Option<FileNode> {
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
-        // Skip if we've already visited this inode (firmlinks, bind-mounts)
         if !ctx.try_register_dir(child_fd) {
             getattrlistbulk::close_dir(child_fd);
-            return FileNode {
-                name: entry.name.clone(),
-                size: 0,
-                is_dir: true,
-                children: Box::new([]),
-                rect: treemap::Rect::new(),
-                file_count: 0,
-                dir_count: 1,
-            };
+            return None;
         }
         let child_abs = current_abs_path.as_ref().map(|p| p.join(&*entry.name));
         let node = build_node_fd(child_fd, entry.name.clone(), child_abs, excluded, progress, ctx);
         getattrlistbulk::close_dir(child_fd);
-        node
+        Some(node)
     };
 
     let dir_nodes: Vec<FileNode> = if dir_names.len() >= 2 {
-        dir_names.par_iter().map(build_child).collect()
+        dir_names.par_iter().filter_map(build_child).collect()
     } else {
-        dir_names.iter().map(build_child).collect()
+        dir_names.iter().filter_map(build_child).collect()
     };
 
     let mut total_dir_count: u64 = 0;
