@@ -461,74 +461,45 @@ impl LoadedState {
                 .split('/')
                 .filter(|s| !s.is_empty())
                 .collect();
-
-            ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
             let last_idx = segments.len().saturating_sub(1);
-            if !segments.is_empty() {
-                ui.label(egui::RichText::new("Macintosh HD").size(13.0));
+
+            let separator = |ui: &mut egui::Ui| {
                 ui.label(
                     egui::RichText::new(" \u{203A} ")
                         .size(13.0)
                         .color(egui::Color32::GRAY),
                 );
+            };
+
+            ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
+
+            // "Macintosh HD" navigates to the volume root.
+            if ui
+                .link(egui::RichText::new("Macintosh HD").size(13.0))
+                .on_hover_text("Scan /")
+                .clicked()
+            {
+                *new_scan_path = Some(PathBuf::from("/"));
             }
+            if !segments.is_empty() {
+                separator(ui);
+            }
+
+            // Each segment is a clickable crumb that rescans that ancestor.
+            // The final segment is the current location: bold, not a link.
             for (i, seg) in segments.iter().enumerate() {
                 if i == last_idx {
                     let blue = egui::Color32::from_rgb(56, 132, 244);
-                    let text = egui::RichText::new(*seg).size(14.0).strong().color(blue);
-                    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-
-                    let chevron_center =
-                        egui::pos2(resp.rect.right() + 6.0, resp.rect.center().y + 1.0);
-                    let s = 3.0;
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        vec![
-                            egui::pos2(chevron_center.x - s, chevron_center.y - s),
-                            egui::pos2(chevron_center.x + s, chevron_center.y - s),
-                            egui::pos2(chevron_center.x, chevron_center.y + s),
-                        ],
-                        blue,
-                        egui::Stroke::NONE,
-                    ));
-                    ui.add_space(14.0);
-
-                    let menu_id = resp.id.with("breadcrumb_menu");
-                    if resp.clicked() {
-                        ui.memory_mut(|m| m.toggle_popup(menu_id));
-                    }
-                    egui::popup_below_widget(
-                        ui,
-                        menu_id,
-                        &resp,
-                        egui::PopupCloseBehavior::CloseOnClick,
-                        |ui| {
-                            ui.set_min_width(200.0);
-                            if ui.button("\u{1F4C2}  Open Folder\u{2026}").clicked()
-                                && let Some(path) = pick_folder()
-                            {
-                                *new_scan_path = Some(path);
-                            }
-                            if segments.len() > 1 {
-                                ui.separator();
-                                let mut path = PathBuf::from("/");
-                                for (j, ancestor) in segments[..last_idx].iter().enumerate() {
-                                    path.push(ancestor);
-                                    let indent = "  ".repeat(j);
-                                    let label = format!("{indent}\u{1F4C1}  {ancestor}");
-                                    if ui.button(&label).clicked() {
-                                        *new_scan_path = Some(path.clone());
-                                    }
-                                }
-                            }
-                        },
-                    );
+                    ui.label(egui::RichText::new(*seg).size(14.0).strong().color(blue));
                 } else {
-                    ui.label(egui::RichText::new(*seg).size(13.0));
-                    ui.label(
-                        egui::RichText::new(" \u{203A} ")
-                            .size(13.0)
-                            .color(egui::Color32::GRAY),
-                    );
+                    if ui.link(egui::RichText::new(*seg).size(13.0)).clicked() {
+                        let mut path = PathBuf::from("/");
+                        for ancestor in &segments[..=i] {
+                            path.push(ancestor);
+                        }
+                        *new_scan_path = Some(path);
+                    }
+                    separator(ui);
                 }
             }
         });
