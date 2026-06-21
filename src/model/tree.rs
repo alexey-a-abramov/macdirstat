@@ -80,6 +80,8 @@ pub struct FileTree {
 /// Scan-wide options and mutable state shared across threads.
 struct ScanCtx {
     skip_duplicates: bool,
+    /// Files strictly smaller than this byte count are ignored (0 = disabled).
+    min_file_size_bytes: u64,
     /// (devid, ino) of every directory we have opened so far.
     seen_dirs: Mutex<HashSet<(u32, u64)>>,
     /// (devid, fileid) of every regular file we have counted so far.
@@ -87,9 +89,10 @@ struct ScanCtx {
 }
 
 impl ScanCtx {
-    fn new(skip_duplicates: bool) -> Self {
+    fn new(skip_duplicates: bool, min_file_size_bytes: u64) -> Self {
         Self {
             skip_duplicates,
+            min_file_size_bytes,
             seen_dirs: Mutex::new(HashSet::new()),
             seen_files: Mutex::new(HashSet::new()),
         }
@@ -127,9 +130,9 @@ impl FileTree {
     /// Build a file tree by scanning the given path using getattrlistbulk.
     /// Directories whose absolute path exactly matches an entry in `excluded` are skipped.
     /// `progress` is incremented once per file discovered (for live UI updates).
-    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, skip_duplicates: bool) -> Self {
+    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, skip_duplicates: bool, min_file_size_bytes: u64) -> Self {
         let ext_map = Mutex::new(HashMap::<Box<str>, u64>::new());
-        let ctx = Arc::new(ScanCtx::new(skip_duplicates));
+        let ctx = Arc::new(ScanCtx::new(skip_duplicates, min_file_size_bytes));
         let root_node = build_root_node(root, excluded, progress, &ctx);
 
         // Drain the main thread's local ext map
@@ -301,6 +304,10 @@ fn build_node_fd(
             }
             dir_names.push(entry);
         } else {
+            // Optimization mode: skip files below the configured threshold
+            if ctx.min_file_size_bytes > 0 && entry.file_size < ctx.min_file_size_bytes {
+                continue;
+            }
             // Skip duplicate file inodes (e.g. hardlinks counted twice)
             if !ctx.try_register_file(entry.devid, entry.fileid) {
                 continue;

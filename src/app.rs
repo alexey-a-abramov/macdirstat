@@ -63,8 +63,9 @@ impl App {
         let excluded = self.settings.excluded_paths();
 
         let skip_duplicates = self.settings.skip_duplicate_inodes;
+        let min_file_size_bytes = self.settings.min_file_size_bytes();
         std::thread::spawn(move || {
-            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone, skip_duplicates);
+            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone, skip_duplicates, min_file_size_bytes);
             let _ = tx.send(tree);
         });
 
@@ -200,6 +201,35 @@ impl eframe::App for App {
                         .small()
                         .color(egui::Color32::GRAY),
                     );
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut self.settings.optimization_mode,
+                        "Optimization mode",
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Skip files smaller than the threshold below.\nGreatly speeds up scans of directories with many tiny files.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                    ui.add_space(4.0);
+                    ui.add_enabled_ui(self.settings.optimization_mode, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Min file size (MB):");
+                            let mut mb_str = self.settings.min_file_size_mb.to_string();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut mb_str)
+                                    .desired_width(60.0),
+                            );
+                            if resp.changed() {
+                                if let Ok(n) = mb_str.trim().parse::<u64>() {
+                                    self.settings.min_file_size_mb = n.max(1);
+                                }
+                            }
+                        });
+                    });
                     ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal(|ui| {
