@@ -24,3 +24,7 @@ target/
 benches/
 CLAUDE.md
 
+# Local scan output / scratch
+data/
+logs/
+
