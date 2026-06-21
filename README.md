@@ -9,7 +9,8 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 - **File type breakdown** showing extension statistics with color coding
 - **Fast scanning** using macOS-native `getattrlistbulk` syscall with parallel tree building via rayon
 - **Delete files/folders** directly from the UI — ⌘Delete for instant delete, Delete for native macOS confirmation dialog
-- **Open any folder** via the File menu, native folder picker on startup, or pass a path on the command line
+- **Scans your home folder on startup** (or a path passed on the command line); open any other folder later via the File menu
+- **Stoppable scans** — hit Stop at any time to halt scanning and inspect what was found so far
 
 ## Screenshot
 
@@ -26,7 +27,7 @@ cargo build --release
 ## Usage
 
 ```sh
-# Launch with folder picker
+# Launch — scans your home folder
 cargo run --release
 
 # Scan a specific directory
