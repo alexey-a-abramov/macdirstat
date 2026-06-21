@@ -13,5 +13,13 @@ libc = "0.2"
 log = "0.4"
 rayon = "1"
 rfd = "0.15"
+rustc-hash = "2"
 treemap = "0.3"
+
+# Release builds favor runtime speed over link time. Thin LTO + a single codegen
+# unit let the compiler inline across modules (notably the in-memory aggregation,
+# sort, and treemap/cushion passes); the syscall-bound scan itself is unaffected.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
