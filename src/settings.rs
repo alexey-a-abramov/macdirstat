@@ -12,6 +12,10 @@ pub struct Settings {
     /// files. Default: true, 25 MiB.
     pub optimization_mode: bool,
     pub min_file_size_mb: u64,
+    /// Advanced: number of worker threads for scanning. 0 = automatic (one per
+    /// logical core). Capping this can help on slow/contended volumes where the
+    /// default oversubscribes the disk; the default is optimal for fast SSDs.
+    pub scan_threads: u64,
 }
 
 impl Default for Settings {
@@ -21,6 +25,7 @@ impl Default for Settings {
             skip_duplicate_inodes: true,
             optimization_mode: true,
             min_file_size_mb: 25,
+            scan_threads: 0,
         }
     }
 }
@@ -41,11 +46,12 @@ impl Settings {
         let _ = std::fs::write(
             path,
             format!(
-                "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\n",
+                "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\nscan_threads={}\n",
                 self.ignore_cloud_storage,
                 self.skip_duplicate_inodes,
                 self.optimization_mode,
                 self.min_file_size_mb,
+                self.scan_threads,
             ),
         );
     }
@@ -62,6 +68,10 @@ impl Settings {
             } else if let Some(val) = line.strip_prefix("min_file_size_mb=") {
                 if let Ok(n) = val.trim().parse::<u64>() {
                     s.min_file_size_mb = n;
+                }
+            } else if let Some(val) = line.strip_prefix("scan_threads=") {
+                if let Ok(n) = val.trim().parse::<u64>() {
+                    s.scan_threads = n;
                 }
             }
         }

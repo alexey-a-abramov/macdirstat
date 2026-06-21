@@ -101,11 +101,16 @@ pub(crate) fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
 
     let mut attrlist: libc::attrlist = unsafe { std::mem::zeroed() };
     attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
-    attrlist.commonattr =
-        ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
+    attrlist.commonattr = ATTR_CMN_RETURNED_ATTRS
+        | ATTR_CMN_NAME
+        | ATTR_CMN_DEVID
+        | ATTR_CMN_OBJTYPE
+        | ATTR_CMN_FILEID;
     attrlist.fileattr = ATTR_FILE_TOTALSIZE;
 
-    let mut results = Vec::new();
+    // Most directories are small; one up-front allocation covers the common case.
+    // parse_dir_entries reserves the exact count for each getattrlistbulk batch.
+    let mut results = Vec::with_capacity(64);
 
     SCAN_BUFFER.with(|buf| {
         let mut buffer = buf.borrow_mut();
@@ -164,6 +169,7 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
 /// TOTALSIZE (fileattr).  We check `returned_commonattr` / `returned_fileattr`
 /// so the parser degrades gracefully on non-APFS volumes.
 fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
+    results.reserve(count); // exact reservation for this batch (multi-batch dirs grow once each)
     let buf_size = buffer.len();
     let mut offset = 0usize;
     for _ in 0..count {

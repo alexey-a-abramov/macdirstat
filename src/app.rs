@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Instant;
 
 use eframe::egui;
@@ -19,12 +22,13 @@ pub struct App {
 }
 
 enum AppState {
-    WaitingForPicker { frames: u8 },
     Scanning {
         path: PathBuf,
         start_time: Instant,
         receiver: std::sync::mpsc::Receiver<FileTree>,
         progress: Arc<AtomicU64>,
+        /// Set to true to ask the background scan thread to stop early.
+        cancel: Arc<AtomicBool>,
     },
     Loaded(Box<LoadedState>),
 }
@@ -38,50 +42,30 @@ struct LoadedState {
     treemap_texture: Option<egui::TextureHandle>,
     pending_scan: Option<PathBuf>,
     open_settings_requested: bool,
+    /// True when the displayed tree came from a scan the user stopped early.
+    partial: bool,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
-        let mut app = Self {
-            state: AppState::WaitingForPicker { frames: 2 },
-            settings: Settings::load(),
+        let settings = Settings::load();
+        // Scan the path given on the command line, otherwise the user's home
+        // directory. Scanning starts immediately on a background thread, so the
+        // window appears already showing scan progress.
+        let path = initial_path
+            .map(PathBuf::from)
+            .unwrap_or_else(default_scan_dir);
+        Self {
+            state: spawn_scan(&settings, path),
+            settings,
             settings_open: false,
             #[cfg(target_os = "macos")]
             about_configured: false,
-        };
-        if let Some(path) = initial_path {
-            app.start_scan(PathBuf::from(path));
         }
-        app
     }
 
     fn start_scan(&mut self, path: PathBuf) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let progress = Arc::new(AtomicU64::new(0));
-        let progress_clone = Arc::clone(&progress);
-        let path_clone = path.clone();
-        let excluded = self.settings.excluded_paths();
-
-        let skip_duplicates = self.settings.skip_duplicate_inodes;
-        let min_file_size_bytes = self.settings.min_file_size_bytes();
-        log::info!(
-            "Scan started: {} (skip_duplicates={}, min_file_size={} MB, {} excluded paths)",
-            path.display(),
-            skip_duplicates,
-            min_file_size_bytes / (1024 * 1024),
-            excluded.len(),
-        );
-        std::thread::spawn(move || {
-            let tree = FileTree::scan(&path_clone, &excluded, &progress_clone, skip_duplicates, min_file_size_bytes);
-            let _ = tx.send(tree);
-        });
-
-        self.state = AppState::Scanning {
-            path,
-            start_time: Instant::now(),
-            receiver: rx,
-            progress,
-        };
+        self.state = spawn_scan(&self.settings, path);
     }
 
     /// Render the top menu bar. Present in every state so Settings and folder
@@ -175,15 +159,26 @@ impl eframe::App for App {
         }
 
         // Check whether the background scan thread has finished.
-        let mut completed: Option<(FileTree, f64)> = None;
-        if let AppState::Scanning { ref receiver, start_time, .. } = self.state {
+        let mut completed: Option<(FileTree, f64, bool)> = None;
+        if let AppState::Scanning {
+            ref receiver,
+            start_time,
+            ref cancel,
+            ..
+        } = self.state
+        {
             if let Ok(tree) = receiver.try_recv() {
-                completed = Some((tree, start_time.elapsed().as_secs_f64() * 1000.0));
+                completed = Some((
+                    tree,
+                    start_time.elapsed().as_secs_f64() * 1000.0,
+                    cancel.load(Ordering::Relaxed),
+                ));
             }
         }
-        if let Some((tree, scan_time_ms)) = completed {
+        if let Some((tree, scan_time_ms, partial)) = completed {
             log::info!(
-                "Scan complete: {} — {} files, {} dirs, {} in {:.0}ms",
+                "Scan {}: {} — {} files, {} dirs, {} in {:.0}ms",
+                if partial { "stopped" } else { "complete" },
                 tree.root_path,
                 tree.root.file_count,
                 tree.root.dir_count,
@@ -200,31 +195,19 @@ impl eframe::App for App {
                 treemap_texture: None,
                 pending_scan: None,
                 open_settings_requested: false,
+                partial,
             }));
         }
 
         match &mut self.state {
-            AppState::WaitingForPicker { frames } => {
-                show_empty_panes(ctx);
-
-                if *frames > 0 {
-                    *frames -= 1;
-                    ctx.request_repaint();
-                } else if *frames == 0 {
-                    // Prevent re-entry after the blocking dialog returns
-                    *frames = u8::MAX;
-                    let result = pick_folder_at_home();
-                    if let Some(path) = result {
-                        self.start_scan(path);
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-                // frames == u8::MAX: dialog was dismissed, waiting for close
-            }
-            AppState::Scanning { path, progress, .. } => {
+            AppState::Scanning {
+                path,
+                progress,
+                cancel,
+                ..
+            } => {
                 let count = progress.load(Ordering::Relaxed);
-                show_scanning_panes(ctx, path, count, &mut self.settings_open);
+                show_scanning_panes(ctx, path, count, cancel, &mut self.settings_open);
                 ctx.request_repaint();
             }
             AppState::Loaded(loaded) => {
@@ -321,6 +304,36 @@ impl eframe::App for App {
                         });
                     });
                     ui.add_space(8.0);
+                    egui::CollapsingHeader::new("Advanced")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Scan threads:");
+                                let mut t_str = self.settings.scan_threads.to_string();
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut t_str).desired_width(60.0),
+                                );
+                                if resp.changed()
+                                    && let Ok(n) = t_str.trim().parse::<u64>()
+                                {
+                                    self.settings.scan_threads = n.min(256);
+                                }
+                                ui.label(
+                                    egui::RichText::new("0 = auto")
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Worker threads used while scanning. 0 uses one per CPU core\n(best for fast SSDs). Lowering to 4\u{2013}8 can help on slow or\nnetwork volumes where too many threads contend for the disk.",
+                                )
+                                .small()
+                                .color(egui::Color32::GRAY),
+                            );
+                        });
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -356,7 +369,7 @@ impl LoadedState {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "{} Files",
-                    format_file_count(self.tree.root.file_count)
+                    format_file_count(self.tree.root.file_count as u64)
                 ));
                 ui.separator();
                 ui.label(format!(
@@ -364,6 +377,16 @@ impl LoadedState {
                     format_size(self.tree.root.size),
                     self.scan_time_ms,
                 ));
+                if self.partial {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("\u{26A0} Partial scan (stopped)")
+                            .color(egui::Color32::from_rgb(220, 150, 40)),
+                    )
+                    .on_hover_text(
+                        "Scan was stopped early — sizes are incomplete. Rescan for full results.",
+                    );
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let has_selection = self.selected.is_some();
@@ -402,11 +425,19 @@ impl LoadedState {
 
                     ui.separator();
 
-                    if ui.button("\u{21BA} Rescan").on_hover_text("\u{2318}R").clicked() {
+                    if ui
+                        .button("\u{21BA} Rescan")
+                        .on_hover_text("\u{2318}R")
+                        .clicked()
+                    {
                         self.pending_scan = Some(PathBuf::from(&self.tree.root_path));
                     }
 
-                    if ui.button("\u{2699}\u{FE0F}").on_hover_text("Settings").clicked() {
+                    if ui
+                        .button("\u{2699}\u{FE0F}")
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
                         self.open_settings_requested = true;
                     }
                 });
@@ -512,8 +543,8 @@ struct DeleteTarget {
     fs_path: std::path::PathBuf,
     is_dir: bool,
     size: u64,
-    file_count: u64,
-    dir_count: u64,
+    file_count: u32,
+    dir_count: u32,
 }
 
 impl DeleteTarget {
@@ -592,13 +623,18 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
     }
 }
 
-/// Render the three-pane layout with empty panels (same IDs as Loaded state).
+/// Render the three-pane scanning layout (same panel IDs as the Loaded state)
+/// with live progress and a Stop control. Clicking Stop flips `cancel`, which
+/// the background scan thread observes and unwinds, keeping the partial tree.
 fn show_scanning_panes(
     ctx: &egui::Context,
     path: &std::path::Path,
     file_count: u64,
+    cancel: &AtomicBool,
     settings_open: &mut bool,
 ) {
+    let stopping = cancel.load(Ordering::Relaxed);
+
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.label(format!(
@@ -606,8 +642,16 @@ fn show_scanning_panes(
                 format_file_count(file_count)
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("\u{2699}\u{FE0F}").on_hover_text("Settings").clicked() {
+                if ui
+                    .button("\u{2699}\u{FE0F}")
+                    .on_hover_text("Settings")
+                    .clicked()
+                {
                     *settings_open = true;
+                }
+                ui.separator();
+                if compact_stop_button(ui, stopping).clicked() {
+                    request_stop(cancel);
                 }
             });
         });
@@ -629,41 +673,81 @@ fn show_scanning_panes(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| path.to_str().unwrap_or(""));
-        let rect = ui.available_rect_before_wrap();
-        let cx = rect.center().x;
-        let cy = rect.center().y;
-        ui.painter().text(
-            egui::pos2(cx, cy - 14.0),
-            egui::Align2::CENTER_CENTER,
-            format!("Scanning \u{201C}{folder_name}\u{201D}\u{2026}"),
-            egui::FontId::proportional(18.0),
-            ui.visuals().text_color(),
-        );
-        ui.painter().text(
-            egui::pos2(cx, cy + 14.0),
-            egui::Align2::CENTER_CENTER,
-            format!("{} files discovered", format_file_count(file_count)),
-            egui::FontId::proportional(14.0),
-            egui::Color32::GRAY,
-        );
+
+        ui.vertical_centered(|ui| {
+            // Push the block to roughly the vertical center of the canvas.
+            let top = ((ui.available_height() - 170.0) * 0.5).max(0.0);
+            ui.add_space(top);
+
+            ui.add(egui::Spinner::new().size(30.0));
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new(format!("Scanning \u{201C}{folder_name}\u{201D}\u{2026}"))
+                    .size(18.0),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} files discovered",
+                    format_file_count(file_count)
+                ))
+                .size(14.0)
+                .color(egui::Color32::GRAY),
+            );
+            ui.add_space(24.0);
+
+            // Prominent Stop button.
+            let (label, fill) = if stopping {
+                ("Stopping\u{2026}", egui::Color32::from_rgb(110, 86, 86))
+            } else {
+                ("\u{25A0}  Stop", egui::Color32::from_rgb(204, 64, 64))
+            };
+            let btn = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(15.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(fill)
+            .min_size(egui::vec2(150.0, 40.0));
+            if ui
+                .add_enabled(!stopping, btn)
+                .on_hover_text("Stop scanning and show what was found so far")
+                .clicked()
+            {
+                request_stop(cancel);
+            }
+
+            if stopping {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Finishing up \u{2014} showing what was found so far\u{2026}",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::GRAY),
+                );
+            }
+        });
     });
 }
 
-fn show_empty_panes(ctx: &egui::Context) {
-    egui::TopBottomPanel::bottom("status_bar").show(ctx, |_ui| {});
+/// A small Stop button for the status bar, mirroring the prominent one.
+fn compact_stop_button(ui: &mut egui::Ui, stopping: bool) -> egui::Response {
+    let (label, fill) = if stopping {
+        ("Stopping\u{2026}", egui::Color32::from_rgb(110, 86, 86))
+    } else {
+        ("\u{25A0} Stop", egui::Color32::from_rgb(204, 64, 64))
+    };
+    let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(fill);
+    ui.add_enabled(!stopping, btn)
+}
 
-    egui::SidePanel::left("tree_view")
-        .default_width(300.0)
-        .min_width(250.0)
-        .show_separator_line(false)
-        .frame(
-            egui::Frame::side_top_panel(ctx.style().as_ref()).inner_margin(egui::Margin::from(8)),
-        )
-        .show(ctx, |ui| {
-            ui::tree_view::show_branding(ui);
-        });
-
-    egui::CentralPanel::default().show(ctx, |_ui| {});
+/// Ask the running scan to stop; the partial tree gathered so far is kept.
+fn request_stop(cancel: &AtomicBool) {
+    if !cancel.swap(true, Ordering::Relaxed) {
+        log::info!("Scan stop requested by user");
+    }
 }
 
 /// After deleting the node at `deleted_path`, determine what to select next.
@@ -702,12 +786,8 @@ fn handle_context_action(
     match action {
         ui::ContextAction::Delete => {
             if let Some(target) = DeleteTarget::from_selection(&loaded.tree, &path) {
-                if native_confirm_delete(
-                    target.name(),
-                    target.size,
-                    &target.fs_path,
-                    target.is_dir,
-                ) {
+                if native_confirm_delete(target.name(), target.size, &target.fs_path, target.is_dir)
+                {
                     execute_delete(loaded, &target);
                 }
             }
@@ -857,16 +937,61 @@ fn configure_about_panel_text() {
     }
 }
 
-/// Folder picker starting at $HOME — used on startup.
-fn pick_folder_at_home() -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
-    rfd::FileDialog::new()
-        .set_title("Select folder to scan")
-        .set_directory(&home)
-        .pick_folder()
+/// Spawn a background scan of `path` and return the `Scanning` state that tracks it.
+fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = Arc::new(AtomicU64::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress_clone = Arc::clone(&progress);
+    let cancel_clone = Arc::clone(&cancel);
+    let path_clone = path.clone();
+    let excluded = settings.excluded_paths();
+
+    let skip_duplicates = settings.skip_duplicate_inodes;
+    let min_file_size_bytes = settings.min_file_size_bytes();
+    let scan_threads = settings.scan_threads as usize;
+    log::info!(
+        "Scan started: {} (skip_duplicates={}, min_file_size={} MB, scan_threads={}, {} excluded paths)",
+        path.display(),
+        skip_duplicates,
+        min_file_size_bytes / (1024 * 1024),
+        if scan_threads == 0 {
+            "auto".to_string()
+        } else {
+            scan_threads.to_string()
+        },
+        excluded.len(),
+    );
+    std::thread::spawn(move || {
+        let tree = FileTree::scan(
+            &path_clone,
+            &excluded,
+            &progress_clone,
+            skip_duplicates,
+            min_file_size_bytes,
+            &cancel_clone,
+            scan_threads,
+        );
+        let _ = tx.send(tree);
+    });
+
+    AppState::Scanning {
+        path,
+        start_time: Instant::now(),
+        receiver: rx,
+        progress,
+        cancel,
+    }
 }
 
-/// Folder picker — used from the breadcrumb menu.
+/// The directory scanned at startup when no path is given on the command line.
+fn default_scan_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Users"))
+}
+
+/// Folder picker — used from the File menu and ⌘O.
 fn pick_folder() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Select folder to scan")

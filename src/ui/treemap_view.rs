@@ -3,10 +3,10 @@ use std::cell::Cell;
 use egui::{Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions, pos2};
 use treemap::{MapItem, Mappable, TreemapLayout};
 
+use super::ContextAction;
 use crate::format_size;
 use crate::model::color::{ColorMap, PALETTE_BRIGHTNESS};
-use crate::model::tree::{FileNode, FileTree, TreePath};
-use super::ContextAction;
+use crate::model::tree::{FileNode, FileTree, NodeRect, TreePath};
 
 /// Cushion surface coefficients: [a_x, a_y, c_x, c_y]
 /// z(x,y) = a_x*x^2 + a_y*y^2 + c_x*x + c_y*y
@@ -149,14 +149,17 @@ pub fn show(
         if let Some(pos) = response.interact_pointer_pos() {
             let mut path = Vec::new();
             if find_node_at(&tree.root, pos, &mut path) {
-                ui.ctx().data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, path));
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, path));
             } else {
-                ui.ctx().data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, Vec::new()));
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, Vec::new()));
             }
         }
     }
     let ctx_node: Option<Vec<usize>> = ui.ctx().data(|d| {
-        d.get_temp::<Vec<usize>>(ctx_node_id).filter(|p| !p.is_empty())
+        d.get_temp::<Vec<usize>>(ctx_node_id)
+            .filter(|p| !p.is_empty())
     });
 
     let action_cell: Cell<Option<ContextAction>> = Cell::new(None);
@@ -191,7 +194,12 @@ pub fn show(
 }
 
 fn layout_node(node: &mut FileNode, bounds: treemap::Rect) {
-    node.rect = bounds;
+    node.rect = NodeRect {
+        x: bounds.x as f32,
+        y: bounds.y as f32,
+        w: bounds.w as f32,
+        h: bounds.h as f32,
+    };
 
     if node.children.is_empty() || node.size == 0 {
         return;
@@ -233,16 +241,31 @@ fn collect_cushion_leaves(
     color_map: &ColorMap,
     leaves: &mut Vec<CushionLeaf>,
 ) {
+    // Sub-pixel pruning: a non-root node smaller than one pixel paints nothing,
+    // and the treemap subdivides children as sub-rectangles of their parent, so
+    // every descendant is also sub-pixel. Stop here — render-equivalent, and on
+    // multi-million-file trees it bounds `leaves` by visible pixels, not files.
+    if !is_root && (node.rect.w < 0.5 || node.rect.h < 0.5) {
+        return;
+    }
+
+    let rect = treemap::Rect::from_points(
+        node.rect.x as f64,
+        node.rect.y as f64,
+        node.rect.w as f64,
+        node.rect.h as f64,
+    );
+
     // Add ridge for this node (skip root per WinDirStat)
     if !is_root {
-        add_ridge(&mut surface, &node.rect, h);
+        add_ridge(&mut surface, &rect, h);
     }
 
     if node.children.is_empty() {
         // Leaf node
         let color = color_map.get_treemap(node.extension());
         leaves.push(CushionLeaf {
-            rect: node.rect,
+            rect,
             surface,
             color,
         });
@@ -350,9 +373,6 @@ fn build_path(root: &FileNode, path: &[usize]) -> String {
     parts.join("/")
 }
 
-fn to_egui_rect(r: &treemap::Rect) -> Rect {
-    Rect::from_min_max(
-        pos2(r.x as f32, r.y as f32),
-        pos2((r.x + r.w) as f32, (r.y + r.h) as f32),
-    )
+fn to_egui_rect(r: &NodeRect) -> Rect {
+    Rect::from_min_max(pos2(r.x, r.y), pos2(r.x + r.w, r.y + r.h))
 }

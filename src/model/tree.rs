@@ -1,10 +1,11 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::scan::getattrlistbulk::{self, DirEntry};
 
@@ -12,7 +13,7 @@ use crate::scan::getattrlistbulk::{self, DirEntry};
 pub type TreePath = Vec<usize>;
 
 thread_local! {
-    static LOCAL_EXT_MAP: RefCell<HashMap<Box<str>, u64>> = RefCell::new(HashMap::new());
+    static LOCAL_EXT_MAP: RefCell<FxHashMap<Box<str>, u64>> = RefCell::new(FxHashMap::default());
 }
 
 fn raw_extension(name: &str) -> &str {
@@ -22,20 +23,39 @@ fn raw_extension(name: &str) -> &str {
     }
 }
 
-/// A node in the file tree. Uses compact representation (Box<str> + Box<[T]>)
-/// as validated by memory benchmarks: 40 bytes/struct, ~78 bytes RSS/node.
+/// Treemap rectangle stored on every node. Four `f32`s (16 bytes) instead of
+/// `treemap::Rect`'s four `f64`s (32 bytes): pixel coordinates never need f64
+/// precision, and egui itself works in f32. The cushion-shading math converts
+/// to f64 only where it needs the extra range.
+#[derive(Clone, Copy, Default)]
+pub struct NodeRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A node in the file tree. Compact by design — 72 bytes/struct.
+/// `Box<str>`/`Box<[T]>` (not String/Vec), an f32 `NodeRect`, and u32 counts
+/// keep per-node memory low: a full-disk scan can hold several million of these.
 pub struct FileNode {
     pub name: Box<str>,
-    pub size: u64,
-    pub is_dir: bool,
     pub children: Box<[FileNode]>,
+    pub size: u64,
     /// Treemap rectangle, set during layout.
-    pub rect: treemap::Rect,
+    pub rect: NodeRect,
     /// Cached file count (1 for files, sum of children for dirs).
-    pub file_count: u64,
+    pub file_count: u32,
     /// Cached directory count (0 for files, 1 + sum of children for dirs).
-    pub dir_count: u64,
+    pub dir_count: u32,
+    pub is_dir: bool,
 }
+
+// Compile-time guard against accidental growth of the per-node footprint.
+const _: () = assert!(
+    std::mem::size_of::<FileNode>() == 72,
+    "FileNode size changed — update this assertion and the doc comment above",
+);
 
 impl FileNode {
     /// Get the file extension, or empty string for dirs/extensionless files.
@@ -82,20 +102,28 @@ struct ScanCtx {
     skip_duplicates: bool,
     /// Files strictly smaller than this byte count are ignored (0 = disabled).
     min_file_size_bytes: u64,
+    /// Set to true to abort the scan early; the partial tree built so far is kept.
+    cancel: Arc<AtomicBool>,
     /// (devid, ino) of every directory we have opened so far.
-    seen_dirs: Mutex<HashSet<(u32, u64)>>,
+    seen_dirs: Mutex<FxHashSet<(u32, u64)>>,
     /// (devid, fileid) of every regular file we have counted so far.
-    seen_files: Mutex<HashSet<(u32, u64)>>,
+    seen_files: Mutex<FxHashSet<(u32, u64)>>,
 }
 
 impl ScanCtx {
-    fn new(skip_duplicates: bool, min_file_size_bytes: u64) -> Self {
+    fn new(skip_duplicates: bool, min_file_size_bytes: u64, cancel: Arc<AtomicBool>) -> Self {
         Self {
             skip_duplicates,
             min_file_size_bytes,
-            seen_dirs: Mutex::new(HashSet::new()),
-            seen_files: Mutex::new(HashSet::new()),
+            cancel,
+            seen_dirs: Mutex::new(FxHashSet::default()),
+            seen_files: Mutex::new(FxHashSet::default()),
         }
+    }
+
+    /// True once the user has requested the scan be stopped.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Register a directory fd. Returns `false` if this (devid, ino) was already seen.
@@ -130,34 +158,53 @@ impl FileTree {
     /// Build a file tree by scanning the given path using getattrlistbulk.
     /// Directories whose absolute path exactly matches an entry in `excluded` are skipped.
     /// `progress` is incremented once per file discovered (for live UI updates).
-    pub fn scan(root: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, skip_duplicates: bool, min_file_size_bytes: u64) -> Self {
-        let ext_map = Mutex::new(HashMap::<Box<str>, u64>::new());
-        let ctx = Arc::new(ScanCtx::new(skip_duplicates, min_file_size_bytes));
-        let root_node = build_root_node(root, excluded, progress, &ctx);
+    /// Setting `cancel` to true aborts traversal early; the partial tree built up
+    /// to that point is still returned.
+    pub fn scan(
+        root: &Path,
+        excluded: &[PathBuf],
+        progress: &Arc<AtomicU64>,
+        skip_duplicates: bool,
+        min_file_size_bytes: u64,
+        cancel: &Arc<AtomicBool>,
+        scan_threads: usize,
+    ) -> Self {
+        let ext_map = Mutex::new(FxHashMap::<Box<str>, u64>::default());
+        let ctx = Arc::new(ScanCtx::new(
+            skip_duplicates,
+            min_file_size_bytes,
+            Arc::clone(cancel),
+        ));
 
-        // Drain the main thread's local ext map
-        LOCAL_EXT_MAP.with(|m| {
-            let local = m.replace(HashMap::new());
-            if !local.is_empty() {
-                let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, v) in local {
-                    *global.entry(k).or_default() += v;
-                }
+        // Build the tree, then drain every thread's local extension map into the
+        // shared `ext_map`. The drain must run on the SAME pool the scan used:
+        // when a custom thread count is requested we install a dedicated pool and
+        // broadcast on *it*, because a global `rayon::broadcast` would miss the
+        // custom pool's worker-thread-local maps and silently lose the extension
+        // statistics.
+        let custom_pool = if scan_threads > 0 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(scan_threads)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
+        let root_node = match &custom_pool {
+            Some(pool) => pool.install(|| {
+                let node = build_root_node(root, excluded, progress, &ctx);
+                drain_local_ext(&ext_map); // this (calling) thread
+                pool.broadcast(|_| drain_local_ext(&ext_map)); // custom pool workers
+                node
+            }),
+            None => {
+                let node = build_root_node(root, excluded, progress, &ctx);
+                drain_local_ext(&ext_map); // this (calling) thread
+                rayon::broadcast(|_| drain_local_ext(&ext_map)); // global pool workers
+                node
             }
-        });
-
-        // Drain all rayon worker thread local ext maps
-        rayon::broadcast(|_| {
-            LOCAL_EXT_MAP.with(|m| {
-                let local = m.replace(HashMap::new());
-                if !local.is_empty() {
-                    let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
-                    for (k, v) in local {
-                        *global.entry(k).or_default() += v;
-                    }
-                }
-            });
-        });
+        };
 
         let mut extensions: Vec<(Box<str>, u64)> = ext_map
             .into_inner()
@@ -208,8 +255,8 @@ impl FileTree {
         &mut self,
         path: &[usize],
         size: u64,
-        file_count: u64,
-        dir_count: u64,
+        file_count: u32,
+        dir_count: u32,
     ) {
         // The direct parent is already updated by remove_child; update grandparents and above.
         let mut node = &mut self.root;
@@ -234,7 +281,7 @@ impl FileTree {
 
     /// Rebuild extension statistics from the current tree.
     pub fn rebuild_extensions(&mut self) {
-        let mut ext_map: HashMap<Box<str>, u64> = HashMap::new();
+        let mut ext_map: FxHashMap<Box<str>, u64> = FxHashMap::default();
         collect_extensions(&self.root, &mut ext_map);
         let mut extensions: Vec<(Box<str>, u64)> = ext_map.into_iter().collect();
         extensions.sort_unstable_by(|a, b| b.1.cmp(&a.1));
@@ -242,7 +289,20 @@ impl FileTree {
     }
 }
 
-fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
+/// Drain this thread's local extension map into the shared global map.
+fn drain_local_ext(ext_map: &Mutex<FxHashMap<Box<str>, u64>>) {
+    LOCAL_EXT_MAP.with(|m| {
+        let local = m.replace(FxHashMap::default());
+        if !local.is_empty() {
+            let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, v) in local {
+                *global.entry(k).or_default() += v;
+            }
+        }
+    });
+}
+
+fn collect_extensions(node: &FileNode, map: &mut FxHashMap<Box<str>, u64>) {
     if !node.is_dir {
         let ext = node.extension();
         if !ext.is_empty() {
@@ -256,7 +316,12 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
     }
 }
 
-fn build_root_node(path: &Path, excluded: &[PathBuf], progress: &Arc<AtomicU64>, ctx: &Arc<ScanCtx>) -> FileNode {
+fn build_root_node(
+    path: &Path,
+    excluded: &[PathBuf],
+    progress: &Arc<AtomicU64>,
+    ctx: &Arc<ScanCtx>,
+) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
     if fd < 0 {
         log::warn!(
@@ -287,13 +352,14 @@ fn build_node_fd(
 
     let entries = getattrlistbulk::scan_dir_entries_fd(parent_fd);
 
-    // Separate files and directories
+    // Separate files and directories. `entries` is consumed by value so each
+    // entry's name (a heap `Box<str>`) is MOVED into its node rather than cloned.
     let mut file_nodes: Vec<FileNode> = Vec::new();
-    let mut dir_names: Vec<&DirEntry> = Vec::new();
+    let mut child_dirs: Vec<DirEntry> = Vec::new();
     let mut total_size: u64 = 0;
-    let mut total_file_count: u64 = 0;
+    let mut total_file_count: u32 = 0;
 
-    for entry in &entries {
+    for entry in entries {
         if entry.is_dir {
             // Skip directories whose absolute path is in the exclusion list
             if let Some(ref parent) = current_abs_path {
@@ -302,7 +368,7 @@ fn build_node_fd(
                     continue;
                 }
             }
-            dir_names.push(entry);
+            child_dirs.push(entry);
         } else {
             // Optimization mode: skip files below the configured threshold
             if ctx.min_file_size_bytes > 0 && entry.file_size < ctx.min_file_size_bytes {
@@ -313,7 +379,7 @@ fn build_node_fd(
                 continue;
             }
             total_size += entry.file_size;
-            total_file_count += 1;
+            total_file_count = total_file_count.saturating_add(1);
             progress.fetch_add(1, Ordering::Relaxed);
             LOCAL_EXT_MAP.with(|m| {
                 let mut map = m.borrow_mut();
@@ -326,43 +392,47 @@ fn build_node_fd(
                 *map.entry(key).or_default() += entry.file_size;
             });
             file_nodes.push(FileNode {
-                name: entry.name.clone(),
-                size: entry.file_size,
-                is_dir: false,
+                name: entry.name, // moved, not cloned
                 children: Box::new([]),
-                rect: treemap::Rect::new(),
+                size: entry.file_size,
+                rect: NodeRect::default(),
                 file_count: 1,
                 dir_count: 0,
+                is_dir: false,
             });
         }
     }
 
-    // Recurse into subdirectories — use openat() relative to parent fd.
-    // Returns None for directories we've already visited (firmlinks, bind-mounts)
-    // so the duplicate is dropped entirely rather than shown as an empty node.
-    let build_child = |entry: &&DirEntry| -> Option<FileNode> {
+    // Recurse into subdirectories — use openat() relative to parent fd, consuming
+    // each DirEntry so its name moves into the child node. Returns None for
+    // directories we've already visited (firmlinks, bind-mounts) or once the scan
+    // is cancelled, so the duplicate/remainder is dropped rather than shown.
+    let build_child = |entry: DirEntry| -> Option<FileNode> {
+        if ctx.is_cancelled() {
+            return None;
+        }
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
         if !ctx.try_register_dir(child_fd) {
             getattrlistbulk::close_dir(child_fd);
             return None;
         }
         let child_abs = current_abs_path.as_ref().map(|p| p.join(&*entry.name));
-        let node = build_node_fd(child_fd, entry.name.clone(), child_abs, excluded, progress, ctx);
+        let node = build_node_fd(child_fd, entry.name, child_abs, excluded, progress, ctx);
         getattrlistbulk::close_dir(child_fd);
         Some(node)
     };
 
-    let dir_nodes: Vec<FileNode> = if dir_names.len() >= 2 {
-        dir_names.par_iter().filter_map(build_child).collect()
+    let dir_nodes: Vec<FileNode> = if child_dirs.len() >= 2 {
+        child_dirs.into_par_iter().filter_map(build_child).collect()
     } else {
-        dir_names.iter().filter_map(build_child).collect()
+        child_dirs.into_iter().filter_map(build_child).collect()
     };
 
-    let mut total_dir_count: u64 = 0;
+    let mut total_dir_count: u32 = 0;
     for child in &dir_nodes {
         total_size += child.size;
-        total_file_count += child.file_count;
-        total_dir_count += child.dir_count;
+        total_file_count = total_file_count.saturating_add(child.file_count);
+        total_dir_count = total_dir_count.saturating_add(child.dir_count);
     }
 
     let mut children: Vec<FileNode> = Vec::with_capacity(file_nodes.len() + dir_nodes.len());
@@ -373,11 +443,11 @@ fn build_node_fd(
 
     FileNode {
         name: node_name,
-        size: total_size,
-        is_dir: true,
         children: children.into(),
-        rect: treemap::Rect::new(),
+        size: total_size,
+        rect: NodeRect::default(),
         file_count: total_file_count,
-        dir_count: total_dir_count + 1,
+        dir_count: total_dir_count.saturating_add(1),
+        is_dir: true,
     }
 }
