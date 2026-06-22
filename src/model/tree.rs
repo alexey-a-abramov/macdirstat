@@ -13,7 +13,7 @@ use crate::scan::getattrlistbulk::{self, DirEntry};
 pub type TreePath = Vec<usize>;
 
 thread_local! {
-    static LOCAL_EXT_MAP: RefCell<FxHashMap<Box<str>, u64>> = RefCell::new(FxHashMap::default());
+    static LOCAL_EXT_MAP: RefCell<FxHashMap<Box<str>, (u64, u64)>> = RefCell::new(FxHashMap::default());
 }
 
 fn raw_extension(name: &str) -> &str {
@@ -89,12 +89,30 @@ impl FileNode {
     }
 }
 
+/// Aggregated statistics for one file extension across the whole scan.
+#[derive(Clone)]
+pub struct ExtStat {
+    pub ext: Box<str>,
+    pub bytes: u64,
+    pub count: u64,
+}
+
+/// A directory summary used by the "Largest folders" view.
+#[derive(Clone)]
+pub struct DirSummary {
+    pub path: TreePath,
+    pub name: Box<str>,
+    pub size: u64,
+    pub file_count: u32,
+    pub dir_count: u32,
+}
+
 /// The complete scanned file tree with precomputed extension statistics.
 pub struct FileTree {
     pub root: FileNode,
     pub root_path: String,
-    /// Extension -> total bytes mapping, sorted by size descending.
-    pub extensions: Vec<(Box<str>, u64)>,
+    /// Per-extension totals (bytes + file count), sorted by bytes descending.
+    pub extensions: Vec<ExtStat>,
 }
 
 /// Scan-wide options and mutable state shared across threads.
@@ -169,7 +187,7 @@ impl FileTree {
         cancel: &Arc<AtomicBool>,
         scan_threads: usize,
     ) -> Self {
-        let ext_map = Mutex::new(FxHashMap::<Box<str>, u64>::default());
+        let ext_map = Mutex::new(FxHashMap::<Box<str>, (u64, u64)>::default());
         let ctx = Arc::new(ScanCtx::new(
             skip_duplicates,
             min_file_size_bytes,
@@ -206,12 +224,13 @@ impl FileTree {
             }
         };
 
-        let mut extensions: Vec<(Box<str>, u64)> = ext_map
+        let mut extensions: Vec<ExtStat> = ext_map
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
             .into_iter()
+            .map(|(ext, (bytes, count))| ExtStat { ext, bytes, count })
             .collect();
-        extensions.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        extensions.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
 
         FileTree {
             root: root_node,
@@ -281,39 +300,201 @@ impl FileTree {
 
     /// Rebuild extension statistics from the current tree.
     pub fn rebuild_extensions(&mut self) {
-        let mut ext_map: FxHashMap<Box<str>, u64> = FxHashMap::default();
+        let mut ext_map: FxHashMap<Box<str>, (u64, u64)> = FxHashMap::default();
         collect_extensions(&self.root, &mut ext_map);
-        let mut extensions: Vec<(Box<str>, u64)> = ext_map.into_iter().collect();
-        extensions.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let mut extensions: Vec<ExtStat> = ext_map
+            .into_iter()
+            .map(|(ext, (bytes, count))| ExtStat { ext, bytes, count })
+            .collect();
+        extensions.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
         self.extensions = extensions;
+    }
+
+    /// Flatten every directory below the root and return the `limit` largest by
+    /// size (descending). Powers the "Largest folders" view.
+    pub fn largest_directories(&self, limit: usize) -> Vec<DirSummary> {
+        let mut dirs: Vec<DirSummary> = Vec::new();
+        let mut path: Vec<usize> = Vec::new();
+        collect_dirs(&self.root, &mut path, &mut dirs);
+        dirs.sort_unstable_by_key(|d| std::cmp::Reverse(d.size));
+        dirs.truncate(limit);
+        dirs
+    }
+
+    /// Incremental refresh: walk the existing tree, drop nodes that no longer
+    /// exist on disk, update file sizes for those that do, and re-sort every
+    /// directory. Much faster than a full rescan when most content is unchanged
+    /// because it only does one `getattrlistbulk` call per directory rather than
+    /// rebuilding the whole tree from scratch.
+    ///
+    /// New files or directories that appeared since the last scan are NOT added;
+    /// use `FileTree::scan` for full discovery.
+    pub fn refresh_exists(
+        mut self,
+        excluded: &[PathBuf],
+        progress: &Arc<AtomicU64>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Self {
+        let root_path = std::path::Path::new(&self.root_path);
+        let fd = getattrlistbulk::open_dir(root_path);
+        if fd >= 0 {
+            refresh_node_fd(&mut self.root, fd, root_path, excluded, progress, cancel);
+            getattrlistbulk::close_dir(fd);
+        }
+        self.rebuild_extensions();
+        self
     }
 }
 
 /// Drain this thread's local extension map into the shared global map.
-fn drain_local_ext(ext_map: &Mutex<FxHashMap<Box<str>, u64>>) {
+fn drain_local_ext(ext_map: &Mutex<FxHashMap<Box<str>, (u64, u64)>>) {
     LOCAL_EXT_MAP.with(|m| {
         let local = m.replace(FxHashMap::default());
         if !local.is_empty() {
             let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
-            for (k, v) in local {
-                *global.entry(k).or_default() += v;
+            for (k, (bytes, count)) in local {
+                let e = global.entry(k).or_insert((0, 0));
+                e.0 += bytes;
+                e.1 += count;
             }
         }
     });
 }
 
-fn collect_extensions(node: &FileNode, map: &mut FxHashMap<Box<str>, u64>) {
+fn collect_extensions(node: &FileNode, map: &mut FxHashMap<Box<str>, (u64, u64)>) {
     if !node.is_dir {
-        let ext = node.extension();
-        if !ext.is_empty() {
-            *map.entry(ext.into()).or_default() += node.size;
-        } else {
-            *map.entry("(no ext)".into()).or_default() += node.size;
-        }
+        let key: Box<str> = {
+            let ext = node.extension();
+            if ext.is_empty() {
+                "(no ext)".into()
+            } else {
+                ext.into()
+            }
+        };
+        let e = map.entry(key).or_insert((0, 0));
+        e.0 += node.size;
+        e.1 += 1;
     }
     for child in node.children.iter() {
         collect_extensions(child, map);
     }
+}
+
+/// Recursively collect every directory (excluding the root) into `out`.
+fn collect_dirs(node: &FileNode, path: &mut Vec<usize>, out: &mut Vec<DirSummary>) {
+    for (i, child) in node.children.iter().enumerate() {
+        if child.is_dir {
+            path.push(i);
+            out.push(DirSummary {
+                path: path.clone(),
+                name: child.name.clone(),
+                size: child.size,
+                file_count: child.file_count,
+                dir_count: child.dir_count,
+            });
+            collect_dirs(child, path, out);
+            path.pop();
+        }
+    }
+}
+
+/// Recursively refresh a directory node using an already-open fd.
+///
+/// - Entries present in the current tree but absent from the filesystem are dropped.
+/// - File sizes are updated to the current on-disk value.
+/// - Directory subtrees are refreshed recursively (each opening its child dirs with openat).
+/// - Children are re-sorted by size descending after the update.
+/// - When cancelled mid-traversal, unvisited children are kept unchanged so the
+///   tree never loses data it hasn't had a chance to verify.
+fn refresh_node_fd(
+    node: &mut FileNode,
+    node_fd: libc::c_int,
+    node_path: &std::path::Path,
+    excluded: &[PathBuf],
+    progress: &Arc<AtomicU64>,
+    cancel: &Arc<AtomicBool>,
+) {
+    if cancel.load(Ordering::Relaxed) || node.children.is_empty() {
+        return;
+    }
+
+    // Read the directory's current contents via the already-open fd.
+    let current_entries = getattrlistbulk::scan_dir_entries_fd(node_fd);
+
+    // Build a fast name → entry lookup.
+    let mut entry_map: FxHashMap<&str, &DirEntry> =
+        FxHashMap::with_capacity_and_hasher(current_entries.len(), Default::default());
+    for entry in &current_entries {
+        entry_map.insert(&entry.name, entry);
+    }
+
+    let old_children = std::mem::take(&mut node.children).into_vec();
+    let mut new_children: Vec<FileNode> = Vec::with_capacity(old_children.len());
+    let mut cancelled = false;
+
+    for mut child in old_children {
+        if cancelled {
+            // Scan was stopped — carry remaining children forward unchanged.
+            new_children.push(child);
+            continue;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            new_children.push(child);
+            continue;
+        }
+
+        // Drop children whose name no longer appears or whose type changed.
+        let Some(entry) = entry_map.get(&*child.name) else {
+            continue;
+        };
+        if entry.is_dir != child.is_dir {
+            continue; // file replaced by dir or vice-versa — treat as deleted
+        }
+
+        if child.is_dir {
+            let child_path = node_path.join(&*child.name);
+            if excluded.iter().any(|e| child_path == *e) {
+                continue; // now excluded — drop it
+            }
+            let child_fd = getattrlistbulk::openat_dir(node_fd, &child.name);
+            if child_fd >= 0 {
+                refresh_node_fd(
+                    &mut child,
+                    child_fd,
+                    &child_path,
+                    excluded,
+                    progress,
+                    cancel,
+                );
+                getattrlistbulk::close_dir(child_fd);
+            }
+            // If we can't open the dir (permission denied) keep the child with
+            // its last-known sizes rather than removing it.
+        } else {
+            child.size = entry.file_size;
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+
+        new_children.push(child);
+    }
+
+    // Re-sort by size descending to maintain the tree invariant.
+    new_children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+    // Recompute this node's aggregate stats from the (possibly pruned) children.
+    let mut total_size = 0u64;
+    let mut total_file_count = 0u32;
+    let mut total_dir_count = 0u32;
+    for child in &new_children {
+        total_size += child.size;
+        total_file_count = total_file_count.saturating_add(child.file_count);
+        total_dir_count = total_dir_count.saturating_add(child.dir_count);
+    }
+    node.children = new_children.into();
+    node.size = total_size;
+    node.file_count = total_file_count;
+    node.dir_count = total_dir_count.saturating_add(1);
 }
 
 fn build_root_node(
@@ -389,7 +570,9 @@ fn build_node_fd(
                 } else {
                     ext.into()
                 };
-                *map.entry(key).or_default() += entry.file_size;
+                let e = map.entry(key).or_insert((0, 0));
+                e.0 += entry.file_size;
+                e.1 += 1;
             });
             file_nodes.push(FileNode {
                 name: entry.name, // moved, not cloned

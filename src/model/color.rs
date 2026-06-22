@@ -140,12 +140,12 @@ pub struct ColorMap {
 }
 
 impl ColorMap {
-    /// Build a color map from sorted extensions (largest first).
-    pub fn from_extensions(extensions: &[(Box<str>, u64)]) -> Self {
+    /// Build a color map from sorted extension stats (largest first).
+    pub fn from_extensions(extensions: &[crate::model::tree::ExtStat]) -> Self {
         let mut map = std::collections::HashMap::new();
-        for (i, (ext, _)) in extensions.iter().enumerate() {
+        for (i, stat) in extensions.iter().enumerate() {
             let idx = i % PALETTE_TEXT.len();
-            map.insert(ext.clone(), (PALETTE_TEXT[idx], PALETTE_TREEMAP[idx]));
+            map.insert(stat.ext.clone(), (PALETTE_TEXT[idx], PALETTE_TREEMAP[idx]));
         }
         Self { map }
     }
