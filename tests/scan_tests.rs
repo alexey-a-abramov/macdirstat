@@ -61,22 +61,14 @@ fn counts_sizes_and_extensions_are_correct() {
     // TOTALSIZE is the logical size; our files sum to 100 bytes.
     assert_eq!(tree.root.size, 100, "10+20+30+40");
 
-    // Extension histogram: txt = 10+20+40 = 70, log = 30.
-    let txt = tree
-        .extensions
-        .iter()
-        .find(|(e, _)| &**e == "txt")
-        .map(|(_, v)| *v);
-    let log = tree
-        .extensions
-        .iter()
-        .find(|(e, _)| &**e == "log")
-        .map(|(_, v)| *v);
-    assert_eq!(txt, Some(70));
-    assert_eq!(log, Some(30));
+    // Extension histogram: txt = 3 files / 10+20+40 = 70, log = 1 file / 30.
+    let txt = tree.extensions.iter().find(|s| &*s.ext == "txt");
+    let log = tree.extensions.iter().find(|s| &*s.ext == "log");
+    assert_eq!(txt.map(|s| (s.bytes, s.count)), Some((70, 3)));
+    assert_eq!(log.map(|s| (s.bytes, s.count)), Some((30, 1)));
 
     // extensions are sorted by size descending.
-    let sizes: Vec<u64> = tree.extensions.iter().map(|(_, v)| *v).collect();
+    let sizes: Vec<u64> = tree.extensions.iter().map(|s| s.bytes).collect();
     let mut sorted = sizes.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     assert_eq!(sizes, sorted, "extensions sorted by size desc");
@@ -223,18 +215,59 @@ fn custom_thread_count_matches_auto() {
     assert_eq!(auto.root.size, pooled.root.size);
 
     // Extension tables must be identical (this is what the pool.broadcast fix protects).
-    let mut a = auto.extensions.clone();
-    let mut b = pooled.extensions.clone();
-    a.sort();
-    b.sort();
+    let to_tuples = |t: &FileTree| -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = t
+            .extensions
+            .iter()
+            .map(|s| (s.ext.to_string(), s.bytes, s.count))
+            .collect();
+        v.sort();
+        v
+    };
+    let a = to_tuples(&auto);
+    let b = to_tuples(&pooled);
     assert_eq!(
         a, b,
         "custom-pool scan must produce the same extension stats"
     );
     assert!(
-        a.iter().any(|(e, _)| &**e == "txt") && a.iter().any(|(e, _)| &**e == "bin"),
+        a.iter().any(|(e, ..)| e == "txt") && a.iter().any(|(e, ..)| e == "bin"),
         "extension stats must be non-empty under a custom thread pool"
     );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn largest_directories_ranks_by_size() {
+    let root = temp_dir("largest");
+    // a/ holds 10000 + a/sub/ 5000 = 15000; b/ holds 100.
+    fs::create_dir_all(root.join("a/sub")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    write_file(&root.join("a/big.dat"), 10_000);
+    write_file(&root.join("a/sub/mid.dat"), 5_000);
+    write_file(&root.join("b/small.dat"), 100);
+
+    let tree = scan(&root, true, 0);
+    let dirs = tree.largest_directories(10);
+
+    assert!(dirs.len() >= 3, "a, a/sub, b");
+    assert_eq!(&*dirs[0].name, "a");
+    assert_eq!(dirs[0].size, 15_000);
+
+    // Ranked strictly descending by size.
+    let sizes: Vec<u64> = dirs.iter().map(|d| d.size).collect();
+    let mut sorted = sizes.clone();
+    sorted.sort_unstable_by(|x, y| y.cmp(x));
+    assert_eq!(sizes, sorted);
+
+    // The recorded index path resolves back to the right node.
+    let node = tree
+        .root
+        .resolve_path(&dirs[0].path)
+        .expect("path resolves");
+    assert_eq!(&*node.name, "a");
+    assert!(node.is_dir);
 
     fs::remove_dir_all(&root).ok();
 }
