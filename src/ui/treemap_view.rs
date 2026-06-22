@@ -27,12 +27,15 @@ const AMBIENT: f64 = 0.13;
 const DIFFUSE: f64 = 1.0 - AMBIENT;
 const BRIGHTNESS_FACTOR: f64 = 0.88 / PALETTE_BRIGHTNESS;
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     tree: &mut FileTree,
+    view_root: &[usize],
     selected: &mut Option<TreePath>,
     color_map: &ColorMap,
     cached_layout_rect: &mut Option<Rect>,
+    cached_view_root: &mut Vec<usize>,
     treemap_texture: &mut Option<TextureHandle>,
 ) -> Option<(TreePath, ContextAction)> {
     let available = ui.available_size();
@@ -43,20 +46,29 @@ pub fn show(
         return None;
     }
 
+    // Resolve the subtree to display; fall back to the whole tree if the path is
+    // stale (e.g. a delete reindexed siblings).
+    let vr: Vec<usize> = if tree.root.resolve_path(view_root).is_some() {
+        view_root.to_vec()
+    } else {
+        Vec::new()
+    };
+
     let w = canvas.width();
     let h = canvas.height();
 
-    // Check if we need to re-layout and re-render the cushion texture.
-    // Compare the full canvas rect (position + size) so that side panel
-    // resizing or window moves trigger a re-layout.
-    let needs_update = if let Some(cached) = *cached_layout_rect {
-        (canvas.left() - cached.left()).abs() > 1.0
-            || (canvas.top() - cached.top()).abs() > 1.0
-            || (w - cached.width()).abs() > 1.0
-            || (h - cached.height()).abs() > 1.0
-    } else {
-        true
+    // Re-layout/re-render when the canvas changed OR we're now showing a
+    // different subtree (the cushion texture is keyed on both).
+    let rect_changed = match *cached_layout_rect {
+        Some(cached) => {
+            (canvas.left() - cached.left()).abs() > 1.0
+                || (canvas.top() - cached.top()).abs() > 1.0
+                || (w - cached.width()).abs() > 1.0
+                || (h - cached.height()).abs() > 1.0
+        }
+        None => true,
     };
+    let needs_update = rect_changed || *cached_view_root != vr;
 
     if needs_update {
         let bounds = treemap::Rect::from_points(
@@ -66,22 +78,17 @@ pub fn show(
             h as f64,
         );
 
-        // Layout the tree
-        layout_node(&mut tree.root, bounds);
+        // Navigate to the (validated) view-root node and lay out its subtree.
+        let mut node = &mut tree.root;
+        for &i in &vr {
+            node = node.children.get_mut(i).expect("view_root validated above");
+        }
+        layout_node(node, bounds);
 
-        // Collect cushion leaves
         let mut leaves = Vec::new();
         let surface = [0.0f64; 4];
-        collect_cushion_leaves(
-            &tree.root,
-            surface,
-            CUSHION_HEIGHT,
-            true,
-            color_map,
-            &mut leaves,
-        );
+        collect_cushion_leaves(node, surface, CUSHION_HEIGHT, true, color_map, &mut leaves);
 
-        // Render cushion texture
         let pw = w as usize;
         let ph = h as usize;
         if pw > 0 && ph > 0 {
@@ -93,6 +100,7 @@ pub fn show(
         }
 
         *cached_layout_rect = Some(canvas);
+        *cached_view_root = vr.clone();
     }
 
     // Paint the cached texture
@@ -101,25 +109,42 @@ pub fn show(
         painter.image(tex.id(), canvas, uv, Color32::WHITE);
     }
 
-    // Handle clicks
+    // Immutable handle to the currently displayed subtree.
+    let base = tree.root.resolve_path(&vr).unwrap_or(&tree.root);
+
+    // Click a node to select it; click the current view's background to go up.
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let mut path = Vec::new();
-        if find_node_at(&tree.root, pos, &mut path) {
-            *selected = Some(path);
-        } else {
-            *selected = None;
+        let mut rel = Vec::new();
+        if find_node_at(base, pos, &mut rel) {
+            if rel.is_empty() {
+                if !vr.is_empty() {
+                    let parent = &vr[..vr.len() - 1];
+                    *selected = if parent.is_empty() {
+                        None
+                    } else {
+                        Some(parent.to_vec())
+                    };
+                }
+            } else {
+                let mut abs = vr.clone();
+                abs.extend(rel);
+                *selected = Some(abs);
+            }
         }
     }
 
     // Hover tooltip
     if let Some(pos) = response.hover_pos() {
-        let mut hover_path = Vec::new();
-        if find_node_at(&tree.root, pos, &mut hover_path)
-            && let Some(node) = resolve_path(&tree.root, &hover_path)
+        let mut rel = Vec::new();
+        if find_node_at(base, pos, &mut rel)
+            && !rel.is_empty()
+            && let Some(node) = base.resolve_path(&rel)
         {
-            let full_path = build_path(&tree.root, &hover_path);
+            let mut abs = vr.clone();
+            abs.extend(rel);
+            let full_path = build_path(&tree.root, &abs);
             let tip = format!("{}\n{}", full_path, format_size(node.size));
             egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), response.id.with("tip"), |ui| {
                 ui.label(tip);
@@ -127,9 +152,11 @@ pub fn show(
         }
     }
 
-    // Draw selection highlight
-    if let Some(sel_path) = selected
-        && let Some(node) = resolve_path(&tree.root, sel_path)
+    // Draw selection highlight (only when the selection is inside this view).
+    if let Some(sel_path) = selected.as_ref()
+        && sel_path.len() >= vr.len()
+        && sel_path[..vr.len()] == vr[..]
+        && let Some(node) = base.resolve_path(&sel_path[vr.len()..])
     {
         let r = to_egui_rect(&node.rect);
         if r.width() > 0.0 && r.height() > 0.0 {
@@ -142,20 +169,22 @@ pub fn show(
         }
     }
 
-    // Context menu on right-click: persist the right-clicked node path across frames
-    // using egui memory, since the popup stays open across multiple frames.
+    // Context menu on right-click: persist the right-clicked node path across
+    // frames via egui memory (the popup stays open across multiple frames).
     let ctx_node_id = response.id.with("ctx_node");
-    if response.secondary_clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let mut path = Vec::new();
-            if find_node_at(&tree.root, pos, &mut path) {
-                ui.ctx()
-                    .data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, path));
-            } else {
-                ui.ctx()
-                    .data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, Vec::new()));
-            }
-        }
+    if response.secondary_clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let mut rel = Vec::new();
+        let abs = if find_node_at(base, pos, &mut rel) && !rel.is_empty() {
+            let mut a = vr.clone();
+            a.extend(rel);
+            a
+        } else {
+            Vec::new()
+        };
+        ui.ctx()
+            .data_mut(|d| d.insert_temp::<Vec<usize>>(ctx_node_id, abs));
     }
     let ctx_node: Option<Vec<usize>> = ui.ctx().data(|d| {
         d.get_temp::<Vec<usize>>(ctx_node_id)
@@ -355,10 +384,6 @@ fn find_node_at(node: &FileNode, pos: egui::Pos2, path: &mut Vec<usize>) -> bool
     }
 
     true
-}
-
-fn resolve_path<'a>(root: &'a FileNode, path: &[usize]) -> Option<&'a FileNode> {
-    root.resolve_path(path)
 }
 
 fn build_path(root: &FileNode, path: &[usize]) -> String {

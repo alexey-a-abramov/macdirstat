@@ -33,17 +33,36 @@ enum AppState {
     Loaded(Box<LoadedState>),
 }
 
+/// Which visualization the right-hand panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Treemap,
+    Sunburst,
+    Largest,
+}
+
 struct LoadedState {
     tree: FileTree,
     color_map: ColorMap,
     selected: Option<TreePath>,
     scan_time_ms: f64,
     cached_layout_rect: Option<egui::Rect>,
+    /// The subtree the cushion texture was last laid out for (treemap navigation).
+    cached_view_root: TreePath,
     treemap_texture: Option<egui::TextureHandle>,
     pending_scan: Option<PathBuf>,
     open_settings_requested: bool,
     /// True when the displayed tree came from a scan the user stopped early.
     partial: bool,
+    /// Optimized rescan requested (check existing nodes only, no full re-walk).
+    pending_refresh: bool,
+    /// Right-panel visualization mode.
+    view_mode: ViewMode,
+    /// Cached "largest folders" ranking, recomputed lazily after tree changes.
+    largest: Option<Vec<crate::model::tree::DirSummary>>,
+    /// "All File Types" report popover state.
+    show_all_file_types: bool,
+    file_types_search: String,
 }
 
 impl App {
@@ -68,6 +87,27 @@ impl App {
         self.state = spawn_scan(&self.settings, path);
     }
 
+    /// Swap the current `Loaded` state out and kick off an optimized background
+    /// refresh that checks existing nodes for existence/size changes without
+    /// doing a full directory walk.  Falls back gracefully if not in Loaded state.
+    fn start_refresh(&mut self) {
+        let placeholder = AppState::Scanning {
+            path: PathBuf::new(),
+            start_time: Instant::now(),
+            receiver: std::sync::mpsc::channel().1,
+            progress: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        match std::mem::replace(&mut self.state, placeholder) {
+            AppState::Loaded(loaded) => {
+                self.state = spawn_refresh(&self.settings, loaded.tree);
+            }
+            other => {
+                self.state = other;
+            }
+        }
+    }
+
     /// Render the top menu bar. Present in every state so Settings and folder
     /// actions are always reachable.
     fn show_menu_bar(&mut self, ctx: &egui::Context) {
@@ -77,6 +117,13 @@ impl App {
         let mut open_settings = false;
 
         let can_rescan = matches!(self.state, AppState::Loaded(_));
+
+        let mut set_mode: Option<ViewMode> = None;
+        let cur_mode = if let AppState::Loaded(loaded) = &self.state {
+            Some(loaded.view_mode)
+        } else {
+            None
+        };
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -112,11 +159,37 @@ impl App {
                 {
                     open_settings = true;
                 }
+
+                // View-mode toggle (only meaningful once a scan is loaded).
+                if let Some(cur) = cur_mode {
+                    ui.separator();
+                    if ui
+                        .selectable_label(cur == ViewMode::Treemap, "\u{25A6} Treemap")
+                        .clicked()
+                    {
+                        set_mode = Some(ViewMode::Treemap);
+                    }
+                    if ui
+                        .selectable_label(cur == ViewMode::Sunburst, "\u{25C9} Sunburst")
+                        .clicked()
+                    {
+                        set_mode = Some(ViewMode::Sunburst);
+                    }
+                    if ui
+                        .selectable_label(cur == ViewMode::Largest, "\u{1F4CA} Largest")
+                        .clicked()
+                    {
+                        set_mode = Some(ViewMode::Largest);
+                    }
+                }
             });
         });
 
         if open_settings {
             self.settings_open = true;
+        }
+        if let (Some(m), AppState::Loaded(loaded)) = (set_mode, &mut self.state) {
+            loaded.view_mode = m;
         }
         if quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -127,10 +200,7 @@ impl App {
             }
         }
         if rescan {
-            if let AppState::Loaded(loaded) = &self.state {
-                let path = PathBuf::from(&loaded.tree.root_path);
-                self.start_scan(path);
-            }
+            self.start_refresh();
         }
     }
 }
@@ -192,10 +262,16 @@ impl eframe::App for App {
                 selected: None,
                 scan_time_ms,
                 cached_layout_rect: None,
+                cached_view_root: Vec::new(),
                 treemap_texture: None,
                 pending_scan: None,
                 open_settings_requested: false,
                 partial,
+                pending_refresh: false,
+                view_mode: ViewMode::Treemap,
+                largest: None,
+                show_all_file_types: false,
+                file_types_search: String::new(),
             }));
         }
 
@@ -216,8 +292,8 @@ impl eframe::App for App {
             }
         }
 
-        // Handle ⌘O, ⌘R, pending scans, and settings_open flag — outside the match
-        // to avoid borrow conflicts with self.state.
+        // Handle ⌘O, ⌘R, pending scans/refreshes, and settings_open flag — outside
+        // the match to avoid borrow conflicts with self.state.
         if let AppState::Loaded(loaded) = &mut self.state {
             let cmd_o = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
             let cmd_r = ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.command);
@@ -225,15 +301,19 @@ impl eframe::App for App {
                 loaded.open_settings_requested = false;
                 self.settings_open = true;
             }
-            let path = if cmd_o {
+            // ⌘R and the status-bar Rescan button both trigger optimized refresh.
+            // ⌘O and breadcrumb/pending_scan trigger a full scan (new root or new settings).
+            let do_refresh = cmd_r || std::mem::take(&mut loaded.pending_refresh);
+            let full_scan_path = if cmd_o {
                 pick_folder()
-            } else if cmd_r {
-                Some(PathBuf::from(&loaded.tree.root_path))
             } else {
                 loaded.pending_scan.take()
             };
-            if let Some(path) = path {
+            // `loaded` last used above; NLL releases the borrow so &mut self is safe below.
+            if let Some(path) = full_scan_path {
                 self.start_scan(path);
+            } else if do_refresh {
+                self.start_refresh();
             }
         }
 
@@ -359,9 +439,11 @@ impl eframe::App for App {
 
 impl LoadedState {
     fn show_panels(&mut self, ctx: &egui::Context) {
+        self.show_file_types_bar(ctx);
         self.show_status_bar(ctx);
         self.show_tree_panel(ctx);
         self.show_central_panel(ctx);
+        self.show_all_file_types_window(ctx);
     }
 
     fn show_status_bar(&mut self, ctx: &egui::Context) {
@@ -430,7 +512,7 @@ impl LoadedState {
                         .on_hover_text("\u{2318}R")
                         .clicked()
                     {
-                        self.pending_scan = Some(PathBuf::from(&self.tree.root_path));
+                        self.pending_refresh = true;
                     }
 
                     if ui
@@ -471,16 +553,129 @@ impl LoadedState {
                 self.pending_scan = Some(path);
             }
 
-            finder_action = ui::treemap_view::show(
-                ui,
-                &mut self.tree,
-                &mut self.selected,
-                &self.color_map,
-                &mut self.cached_layout_rect,
-                &mut self.treemap_texture,
-            );
+            // The right panel follows the selection: a folder shows its own
+            // contents, a file shows its parent folder.
+            let view_root = derived_view_root(&self.tree, &self.selected);
+
+            match self.view_mode {
+                ViewMode::Treemap => {
+                    finder_action = ui::treemap_view::show(
+                        ui,
+                        &mut self.tree,
+                        &view_root,
+                        &mut self.selected,
+                        &self.color_map,
+                        &mut self.cached_layout_rect,
+                        &mut self.cached_view_root,
+                        &mut self.treemap_texture,
+                    );
+                }
+                ViewMode::Sunburst => {
+                    ui::sunburst_view::show(
+                        ui,
+                        &self.tree,
+                        &view_root,
+                        &mut self.selected,
+                        &self.color_map,
+                    );
+                }
+                ViewMode::Largest => {
+                    if self.largest.is_none() {
+                        self.largest = Some(self.tree.largest_directories(200));
+                    }
+                    if let Some(dirs) = self.largest.as_ref() {
+                        ui::largest_view::show(ui, &self.tree, dirs, &mut self.selected);
+                    }
+                }
+            }
         });
         handle_context_action(self, ctx, finder_action);
+    }
+
+    /// Bottom strip: the top file types by size, plus an "All File Types" button.
+    fn show_file_types_bar(&mut self, ctx: &egui::Context) {
+        if self.tree.extensions.is_empty() {
+            return;
+        }
+        let total = self.tree.root.size.max(1);
+        egui::TopBottomPanel::bottom("file_types_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for stat in self.tree.extensions.iter().take(5) {
+                    let pct = stat.bytes as f64 / total as f64 * 100.0;
+                    let color = self.color_map.get(&stat.ext);
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, color);
+                    ui.label(format!("{}  {:.0}%", stat.ext, pct));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let more = self.tree.extensions.len().saturating_sub(5);
+                    let label = if more > 0 {
+                        format!("\u{2295} {} more", more)
+                    } else {
+                        "All file types".to_string()
+                    };
+                    if ui.button(label).clicked() {
+                        self.show_all_file_types = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        });
+    }
+
+    /// The searchable "All File Types" report popover (counts, sizes, %).
+    fn show_all_file_types_window(&mut self, ctx: &egui::Context) {
+        if !self.show_all_file_types {
+            return;
+        }
+        let total = self.tree.root.size.max(1);
+        let mut open = true;
+        egui::Window::new("All File Types")
+            .open(&mut open)
+            .default_width(440.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.file_types_search)
+                        .hint_text("Search")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                let q = self.file_types_search.trim().to_lowercase();
+                egui::ScrollArea::vertical()
+                    .max_height(440.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("ext_grid")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing(egui::vec2(14.0, 4.0))
+                            .show(ui, |ui| {
+                                for stat in &self.tree.extensions {
+                                    if !q.is_empty() && !stat.ext.to_lowercase().contains(&q) {
+                                        continue;
+                                    }
+                                    let pct = stat.bytes as f64 / total as f64 * 100.0;
+                                    ui.horizontal(|ui| {
+                                        let color = self.color_map.get(&stat.ext);
+                                        let (dot, _) = ui.allocate_exact_size(
+                                            egui::vec2(10.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(dot.center(), 4.0, color);
+                                        ui.label(&*stat.ext);
+                                    });
+                                    ui.label(format!("{} files", format_file_count(stat.count)));
+                                    ui.label(format_size(stat.bytes));
+                                    ui.label(format!("{:.1}%", pct));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        self.show_all_file_types = open;
     }
 
     fn show_breadcrumb(&self, ui: &mut egui::Ui, new_scan_path: &mut Option<PathBuf>) {
@@ -615,7 +810,9 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
             loaded.color_map = ColorMap::from_extensions(&loaded.tree.extensions);
             loaded.selected = next_selection_after_delete(&loaded.tree.root, &target.sel_path);
             loaded.cached_layout_rect = None;
+            loaded.cached_view_root.clear();
             loaded.treemap_texture = None;
+            loaded.largest = None; // ranking is now stale
         }
         Err(e) => {
             log::error!("Failed to delete {:?}: {}", target.fs_path, e);
@@ -937,6 +1134,33 @@ fn configure_about_panel_text() {
     }
 }
 
+/// Spawn a background optimized refresh and return a `Scanning` state tracking it.
+/// The existing tree is moved to the background thread, refreshed in-place
+/// (deleted nodes removed, file sizes updated), then sent back.
+fn spawn_refresh(settings: &Settings, tree: FileTree) -> AppState {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = Arc::new(AtomicU64::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress_clone = Arc::clone(&progress);
+    let cancel_clone = Arc::clone(&cancel);
+    let path = PathBuf::from(&tree.root_path);
+    let excluded = settings.excluded_paths();
+
+    log::info!("Optimized refresh started: {}", path.display());
+    std::thread::spawn(move || {
+        let refreshed = tree.refresh_exists(&excluded, &progress_clone, &cancel_clone);
+        let _ = tx.send(refreshed);
+    });
+
+    AppState::Scanning {
+        path,
+        start_time: Instant::now(),
+        receiver: rx,
+        progress,
+        cancel,
+    }
+}
+
 /// Spawn a background scan of `path` and return the `Scanning` state that tracks it.
 fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -985,6 +1209,20 @@ fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
 }
 
 /// The directory scanned at startup when no path is given on the command line.
+/// The folder the right-hand view should show, given the current selection:
+/// a selected directory shows its own contents; a selected file shows its
+/// parent folder; no selection shows the scan root.
+fn derived_view_root(tree: &FileTree, selected: &Option<TreePath>) -> TreePath {
+    match selected {
+        None => Vec::new(),
+        Some(p) => match tree.root.resolve_path(p) {
+            Some(n) if n.is_dir => p.clone(),
+            Some(_) => p[..p.len().saturating_sub(1)].to_vec(),
+            None => Vec::new(),
+        },
+    }
+}
+
 fn default_scan_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
