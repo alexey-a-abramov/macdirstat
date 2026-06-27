@@ -16,6 +16,9 @@ pub struct Settings {
     /// logical core). Capping this can help on slow/contended volumes where the
     /// default oversubscribes the disk; the default is optimal for fast SSDs.
     pub scan_threads: u64,
+    /// User-defined absolute folder paths to skip entirely during scans.
+    /// Useful for slow/network/cloud trees the built-in toggle doesn't cover.
+    pub custom_excludes: Vec<String>,
 }
 
 impl Default for Settings {
@@ -26,6 +29,7 @@ impl Default for Settings {
             optimization_mode: true,
             min_file_size_mb: 25,
             scan_threads: 0,
+            custom_excludes: Vec::new(),
         }
     }
 }
@@ -43,17 +47,26 @@ impl Settings {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\nscan_threads={}\n",
-                self.ignore_cloud_storage,
-                self.skip_duplicate_inodes,
-                self.optimization_mode,
-                self.min_file_size_mb,
-                self.scan_threads,
-            ),
+        let _ = std::fs::write(path, self.serialize());
+    }
+
+    /// Serialize to the flat `key=value` settings format. Custom excludes are
+    /// written as repeated `exclude=<path>` lines.
+    fn serialize(&self) -> String {
+        let mut out = format!(
+            "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\nscan_threads={}\n",
+            self.ignore_cloud_storage,
+            self.skip_duplicate_inodes,
+            self.optimization_mode,
+            self.min_file_size_mb,
+            self.scan_threads,
         );
+        for p in &self.custom_excludes {
+            out.push_str("exclude=");
+            out.push_str(p);
+            out.push('\n');
+        }
+        out
     }
 
     fn parse(content: &str) -> Self {
@@ -73,6 +86,11 @@ impl Settings {
                 if let Ok(n) = val.trim().parse::<u64>() {
                     s.scan_threads = n;
                 }
+            } else if let Some(val) = line.strip_prefix("exclude=") {
+                let p = val.trim();
+                if !p.is_empty() {
+                    s.custom_excludes.push(p.to_string());
+                }
             }
         }
         s
@@ -88,16 +106,65 @@ impl Settings {
         }
     }
 
+    /// Absolute folder paths the scanner should skip: the built-in cloud roots
+    /// (when enabled) plus any user-defined excludes.
     pub fn excluded_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        if self.ignore_cloud_storage {
-            if let Ok(home) = std::env::var("HOME") {
-                let home = PathBuf::from(home);
-                paths.push(home.join("Library/CloudStorage"));
-                paths.push(home.join("Library/Mobile Documents"));
-            }
+        if self.ignore_cloud_storage
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let home = PathBuf::from(home);
+            // Modern macOS routes Google Drive / OneDrive / Dropbox / Box and
+            // iCloud Drive through the File Provider extension under these two
+            // roots; the legacy top-level mounts are covered as a fallback.
+            paths.push(home.join("Library/CloudStorage"));
+            paths.push(home.join("Library/Mobile Documents"));
+            paths.push(home.join("Dropbox"));
+            paths.push(home.join("OneDrive"));
+            paths.push(home.join("Google Drive"));
+        }
+        for c in &self.custom_excludes {
+            paths.push(PathBuf::from(c));
         }
         paths
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_parse_roundtrip_with_excludes() {
+        let mut s = Settings::default();
+        s.optimization_mode = false;
+        s.scan_threads = 6;
+        s.custom_excludes = vec![
+            "/Users/me/Library/Caches".to_string(),
+            "/Volumes/Backup".to_string(),
+        ];
+        let parsed = Settings::parse(&s.serialize());
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn excluded_paths_includes_cloud_and_custom() {
+        let mut s = Settings::default();
+        s.ignore_cloud_storage = true;
+        s.custom_excludes = vec!["/tmp/skip-me".to_string()];
+        let paths = s.excluded_paths();
+        assert!(paths.iter().any(|p| p.ends_with("Library/CloudStorage")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("Library/Mobile Documents"))
+        );
+        assert!(paths.iter().any(|p| p == &PathBuf::from("/tmp/skip-me")));
+
+        s.ignore_cloud_storage = false;
+        let paths = s.excluded_paths();
+        assert!(!paths.iter().any(|p| p.ends_with("Library/CloudStorage")));
+        assert!(paths.iter().any(|p| p == &PathBuf::from("/tmp/skip-me")));
     }
 }
 

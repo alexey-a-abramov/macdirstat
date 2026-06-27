@@ -336,11 +336,43 @@ impl eframe::App for App {
                     ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new(
-                            "Excludes from scans:\n  \u{2022} ~/Library/CloudStorage  (Google Drive, OneDrive\u{2026})\n  \u{2022} ~/Library/Mobile\u{202F}Documents  (iCloud)",
+                            "Skips the cloud roots — these enumerate over the network and can be very slow:\n  \u{2022} ~/Library/CloudStorage  (Google Drive, OneDrive, Dropbox, Box\u{2026})\n  \u{2022} ~/Library/Mobile\u{202F}Documents  (iCloud Drive)\n  \u{2022} ~/Dropbox, ~/OneDrive, ~/Google Drive",
                         )
                         .small()
                         .color(egui::Color32::GRAY),
                     );
+
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Excluded folders").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Folders skipped entirely during scans (slow, network, or cloud trees).",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                    ui.add_space(2.0);
+                    let mut remove_idx: Option<usize> = None;
+                    for (i, p) in self.settings.custom_excludes.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("\u{2715}").on_hover_text("Remove").clicked() {
+                                remove_idx = Some(i);
+                            }
+                            ui.label(egui::RichText::new(p).small());
+                        });
+                    }
+                    if let Some(i) = remove_idx {
+                        self.settings.custom_excludes.remove(i);
+                    }
+                    if ui.button("\u{2795} Add folder\u{2026}").clicked()
+                        && let Some(path) = pick_folder()
+                    {
+                        let s = path.to_string_lossy().into_owned();
+                        if !self.settings.custom_excludes.contains(&s) {
+                            self.settings.custom_excludes.push(s);
+                        }
+                    }
+
                     ui.add_space(8.0);
                     ui.checkbox(
                         &mut self.settings.skip_duplicate_inodes,
