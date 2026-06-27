@@ -112,6 +112,20 @@ pub fn show(
     // Immutable handle to the currently displayed subtree.
     let base = tree.root.resolve_path(&vr).unwrap_or(&tree.root);
 
+    // Thin borders around the top-level regions give the cushions definition —
+    // otherwise large same-colored areas blend into one washed-out blob.
+    for child in base.children.iter() {
+        let r = to_egui_rect(&child.rect);
+        if r.width() > 1.5 && r.height() > 1.5 {
+            painter.rect_stroke(
+                r,
+                0.0,
+                egui::Stroke::new(0.8, Color32::from_black_alpha(80)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
     // Click a node to select it; click the current view's background to go up.
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
@@ -144,10 +158,21 @@ pub fn show(
         {
             let mut abs = vr.clone();
             abs.extend(rel);
-            let full_path = build_path(&tree.root, &abs);
-            let tip = format!("{}\n{}", full_path, format_size(node.size));
+            let full_path = tree
+                .build_fs_path(&abs)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let name = node.name.to_string();
+            let size = format_size(node.size);
             egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), response.id.with("tip"), |ui| {
-                ui.label(tip);
+                ui.set_max_width(440.0);
+                ui.strong(name);
+                ui.label(size);
+                ui.label(
+                    egui::RichText::new(full_path)
+                        .small()
+                        .color(Color32::from_gray(150)),
+                );
             });
         }
     }
@@ -384,18 +409,6 @@ fn find_node_at(node: &FileNode, pos: egui::Pos2, path: &mut Vec<usize>) -> bool
     }
 
     true
-}
-
-fn build_path(root: &FileNode, path: &[usize]) -> String {
-    let mut parts = vec![&*root.name];
-    let mut node = root;
-    for &idx in path {
-        if let Some(child) = node.children.get(idx) {
-            parts.push(&child.name);
-            node = child;
-        }
-    }
-    parts.join("/")
 }
 
 fn to_egui_rect(r: &NodeRect) -> Rect {

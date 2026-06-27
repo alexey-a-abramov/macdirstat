@@ -63,6 +63,8 @@ struct LoadedState {
     /// "All File Types" report popover state.
     show_all_file_types: bool,
     file_types_search: String,
+    /// (free, total, volume name) of the scanned volume, for the sidebar bar.
+    volume: Option<(u64, u64, String)>,
 }
 
 impl App {
@@ -137,6 +139,17 @@ impl App {
                         .clicked()
                     {
                         rescan = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Full Disk Access\u{2026}")
+                        .on_hover_text(
+                            "Open System Settings to let MacDirStat read protected folders",
+                        )
+                        .clicked()
+                    {
+                        open_full_disk_access_settings();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -256,6 +269,7 @@ impl eframe::App for App {
                 scan_time_ms,
             );
             let color_map = ColorMap::from_extensions(&tree.extensions);
+            let volume = volume_info(std::path::Path::new(&tree.root_path));
             self.state = AppState::Loaded(Box::new(LoadedState {
                 tree,
                 color_map,
@@ -272,6 +286,7 @@ impl eframe::App for App {
                 largest: None,
                 show_all_file_types: false,
                 file_types_search: String::new(),
+                volume,
             }));
         }
 
@@ -570,6 +585,7 @@ impl LoadedState {
                     .inner_margin(egui::Margin::from(8)),
             )
             .show(ctx, |ui| {
+                show_volume_bar(ui, &self.volume);
                 finder_action = ui::tree_view::show(ui, &self.tree.root, &mut self.selected);
             });
         handle_context_action(self, ctx, finder_action);
@@ -578,6 +594,9 @@ impl LoadedState {
     fn show_central_panel(&mut self, ctx: &egui::Context) {
         let mut finder_action = None;
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.tree.permission_denied > 0 {
+                show_permission_banner(ui, self.tree.permission_denied);
+            }
             let mut new_scan_path: Option<PathBuf> = None;
             self.show_breadcrumb(ui, &mut new_scan_path);
             ui.add_space(2.0);
@@ -1253,6 +1272,105 @@ fn derived_view_root(tree: &FileTree, selected: &Option<TreePath>) -> TreePath {
             None => Vec::new(),
         },
     }
+}
+
+/// Free/total bytes and a display name for the volume containing `path`.
+fn volume_info(path: &std::path::Path) -> Option<(u64, u64, String)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    let bsize = s.f_bsize as u64;
+    let total = s.f_blocks * bsize;
+    let free = s.f_bavail * bsize;
+    let mnt = unsafe { std::ffi::CStr::from_ptr(s.f_mntonname.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let name = if mnt == "/" {
+        "Macintosh HD".to_string()
+    } else {
+        std::path::Path::new(&mnt)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or(mnt)
+    };
+    Some((free, total, name))
+}
+
+/// Render the volume name + a used/free space bar at the top of the sidebar.
+fn show_volume_bar(ui: &mut egui::Ui, volume: &Option<(u64, u64, String)>) {
+    let Some((free, total, name)) = volume else {
+        return;
+    };
+    let (free, total) = (*free, *total);
+    let used = total.saturating_sub(free);
+    let frac = if total > 0 {
+        (used as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("\u{1F5B4}\u{FE0F}");
+        ui.strong(name);
+    });
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 7.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 3.5, egui::Color32::from_gray(70));
+    let mut fill = rect;
+    fill.set_width(rect.width() * frac);
+    let bar = if frac > 0.9 {
+        egui::Color32::from_rgb(220, 90, 70) // nearly full → warn
+    } else {
+        egui::Color32::from_rgb(56, 132, 244)
+    };
+    p.rect_filled(fill, 3.5, bar);
+    ui.label(
+        egui::RichText::new(format!(
+            "{} free of {}",
+            format_size(free),
+            format_size(total)
+        ))
+        .small()
+        .color(egui::Color32::GRAY),
+    );
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(2.0);
+}
+
+/// A banner shown when the scan hit unreadable directories (missing Full Disk Access).
+fn show_permission_banner(ui: &mut egui::Ui, denied: u64) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(64, 52, 22))
+        .inner_margin(8.0)
+        .corner_radius(6.0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{26A0} {} folders couldn't be read — totals are incomplete.",
+                        format_file_count(denied)
+                    ))
+                    .color(egui::Color32::from_rgb(240, 205, 130)),
+                );
+                if ui.button("Grant Full Disk Access\u{2026}").clicked() {
+                    open_full_disk_access_settings();
+                }
+            });
+        });
+    ui.add_space(4.0);
+}
+
+/// Open System Settings at Privacy & Security → Full Disk Access.
+fn open_full_disk_access_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+        .spawn();
+    log::info!("Opened Full Disk Access settings pane");
 }
 
 fn default_scan_dir() -> PathBuf {

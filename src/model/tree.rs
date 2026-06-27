@@ -113,6 +113,9 @@ pub struct FileTree {
     pub root_path: String,
     /// Per-extension totals (bytes + file count), sorted by bytes descending.
     pub extensions: Vec<ExtStat>,
+    /// Directories that could not be opened during the scan (usually because the
+    /// app lacks Full Disk Access). Their contents are missing from the totals.
+    pub permission_denied: u64,
 }
 
 /// Scan-wide options and mutable state shared across threads.
@@ -126,6 +129,8 @@ struct ScanCtx {
     seen_dirs: Mutex<FxHashSet<(u32, u64)>>,
     /// (devid, fileid) of every regular file we have counted so far.
     seen_files: Mutex<FxHashSet<(u32, u64)>>,
+    /// Count of directories that could not be opened (permission denied, etc.).
+    denied: AtomicU64,
 }
 
 impl ScanCtx {
@@ -136,6 +141,7 @@ impl ScanCtx {
             cancel,
             seen_dirs: Mutex::new(FxHashSet::default()),
             seen_files: Mutex::new(FxHashSet::default()),
+            denied: AtomicU64::new(0),
         }
     }
 
@@ -236,6 +242,7 @@ impl FileTree {
             root: root_node,
             root_path: root.display().to_string(),
             extensions,
+            permission_denied: ctx.denied.load(Ordering::Relaxed),
         }
     }
 
@@ -505,6 +512,7 @@ fn build_root_node(
 ) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
     if fd < 0 {
+        ctx.denied.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "Could not open directory {:?} (permission denied or not found)",
             path
@@ -595,6 +603,9 @@ fn build_node_fd(
             return None;
         }
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
+        if child_fd < 0 {
+            ctx.denied.fetch_add(1, Ordering::Relaxed);
+        }
         if !ctx.try_register_dir(child_fd) {
             getattrlistbulk::close_dir(child_fd);
             return None;
