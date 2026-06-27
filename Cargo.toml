@@ -11,9 +11,11 @@ egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 log = "0.4"
+postcard = { version = "1", features = ["use-std"] }
 rayon = "1"
 rfd = "0.15"
 rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
 treemap = "0.3"
 
 # Release builds favor runtime speed over link time. Thin LTO + a single codegen

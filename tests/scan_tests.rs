@@ -273,6 +273,39 @@ fn largest_directories_ranks_by_size() {
 }
 
 #[test]
+fn cache_save_load_roundtrip() {
+    let root = temp_dir("cache");
+    write_file(&root.join("a.txt"), 10);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    write_file(&root.join("sub/b.bin"), 5_000);
+    let tree = scan(&root, true, 0);
+
+    macdirstat::cache::save(&tree, 42.0);
+    let (back, ms) = macdirstat::cache::load(&tree.root_path).expect("cache loads back");
+
+    assert_eq!(ms, 42.0);
+    assert_eq!(back.root_path, tree.root_path);
+    assert_eq!(back.root.file_count, tree.root.file_count);
+    assert_eq!(back.root.dir_count, tree.root.dir_count);
+    assert_eq!(back.root.size, tree.root.size);
+    assert_eq!(back.root.children.len(), tree.root.children.len());
+
+    let orig: Vec<(String, u64, u64)> = tree
+        .extensions
+        .iter()
+        .map(|s| (s.ext.to_string(), s.bytes, s.count))
+        .collect();
+    let loaded: Vec<(String, u64, u64)> = back
+        .extensions
+        .iter()
+        .map(|s| (s.ext.to_string(), s.bytes, s.count))
+        .collect();
+    assert_eq!(orig, loaded, "extension stats survive the cache round-trip");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn filenode_is_compact() {
     // Memory footprint guard (mirrors the const assertion in tree.rs).
     assert_eq!(std::mem::size_of::<FileNode>(), 72);

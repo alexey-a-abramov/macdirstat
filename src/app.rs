@@ -72,6 +72,42 @@ struct LoadedState {
     /// Back/forward history of `current_dir`.
     history: Vec<TreePath>,
     history_pos: usize,
+    /// True when this tree was loaded from the on-disk cache (not freshly scanned).
+    from_cache: bool,
+}
+
+/// Build a `Loaded` state from a finished/loaded tree (shared by scan completion
+/// and instant cache load on startup).
+fn loaded_state(
+    tree: FileTree,
+    scan_time_ms: f64,
+    partial: bool,
+    from_cache: bool,
+) -> Box<LoadedState> {
+    let color_map = ColorMap::from_extensions(&tree.extensions);
+    let volume = volume_info(std::path::Path::new(&tree.root_path));
+    Box::new(LoadedState {
+        tree,
+        color_map,
+        selected: None,
+        scan_time_ms,
+        cached_layout_rect: None,
+        cached_view_root: Vec::new(),
+        treemap_texture: None,
+        pending_scan: None,
+        open_settings_requested: false,
+        partial,
+        pending_refresh: false,
+        view_mode: ViewMode::Treemap,
+        largest: None,
+        show_all_file_types: false,
+        file_types_search: String::new(),
+        volume,
+        current_dir: Vec::new(),
+        history: vec![Vec::new()],
+        history_pos: 0,
+        from_cache,
+    })
 }
 
 /// A navigation request collected during rendering and applied afterwards.
@@ -146,8 +182,16 @@ impl App {
         let path = initial_path
             .map(PathBuf::from)
             .unwrap_or_else(default_scan_dir);
+        // Render the previous scan instantly from cache if we have one; otherwise
+        // fall back to a fresh scan. Either way the user can Rescan to refresh.
+        let state = match path.to_str().and_then(crate::cache::load) {
+            Some((tree, scan_time_ms)) => {
+                AppState::Loaded(loaded_state(tree, scan_time_ms, false, true))
+            }
+            None => spawn_scan(&settings, path),
+        };
         Self {
-            state: spawn_scan(&settings, path),
+            state,
             settings,
             settings_open: false,
             #[cfg(target_os = "macos")]
@@ -338,29 +382,7 @@ impl eframe::App for App {
                 format_size(tree.root.size),
                 scan_time_ms,
             );
-            let color_map = ColorMap::from_extensions(&tree.extensions);
-            let volume = volume_info(std::path::Path::new(&tree.root_path));
-            self.state = AppState::Loaded(Box::new(LoadedState {
-                tree,
-                color_map,
-                selected: None,
-                scan_time_ms,
-                cached_layout_rect: None,
-                cached_view_root: Vec::new(),
-                treemap_texture: None,
-                pending_scan: None,
-                open_settings_requested: false,
-                partial,
-                pending_refresh: false,
-                view_mode: ViewMode::Treemap,
-                largest: None,
-                show_all_file_types: false,
-                file_types_search: String::new(),
-                volume,
-                current_dir: Vec::new(),
-                history: vec![Vec::new()],
-                history_pos: 0,
-            }));
+            self.state = AppState::Loaded(loaded_state(tree, scan_time_ms, partial, false));
         }
 
         match &mut self.state {
@@ -639,6 +661,14 @@ impl LoadedState {
                     .on_hover_text(
                         "Scan was stopped early — sizes are incomplete. Rescan for full results.",
                     );
+                }
+                if self.from_cache {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("\u{1F4E6} Cached")
+                            .color(egui::Color32::from_rgb(120, 170, 240)),
+                    )
+                    .on_hover_text("Showing a cached scan — press Rescan to refresh.");
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1415,7 +1445,11 @@ fn spawn_refresh(settings: &Settings, tree: FileTree) -> AppState {
 
     log::info!("Optimized refresh started: {}", path.display());
     std::thread::spawn(move || {
+        let t = Instant::now();
         let refreshed = tree.refresh_exists(&excluded, &progress_clone, &cancel_clone);
+        if !cancel_clone.load(Ordering::Relaxed) {
+            crate::cache::save(&refreshed, t.elapsed().as_secs_f64() * 1000.0);
+        }
         let _ = tx.send(refreshed);
     });
 
@@ -1454,6 +1488,7 @@ fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
         excluded.len(),
     );
     std::thread::spawn(move || {
+        let t = Instant::now();
         let tree = FileTree::scan(
             &path_clone,
             &excluded,
@@ -1463,6 +1498,10 @@ fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
             &cancel_clone,
             scan_threads,
         );
+        // Persist the cache only for complete scans (a stopped scan is partial).
+        if !cancel_clone.load(Ordering::Relaxed) {
+            crate::cache::save(&tree, t.elapsed().as_secs_f64() * 1000.0);
+        }
         let _ = tx.send(tree);
     });
 

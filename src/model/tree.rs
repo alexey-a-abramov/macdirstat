@@ -6,6 +6,7 @@ use std::sync::{
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 
 use crate::scan::getattrlistbulk::{self, DirEntry};
 
@@ -38,11 +39,13 @@ pub struct NodeRect {
 /// A node in the file tree. Compact by design — 72 bytes/struct.
 /// `Box<str>`/`Box<[T]>` (not String/Vec), an f32 `NodeRect`, and u32 counts
 /// keep per-node memory low: a full-disk scan can hold several million of these.
+#[derive(Serialize, Deserialize)]
 pub struct FileNode {
     pub name: Box<str>,
     pub children: Box<[FileNode]>,
     pub size: u64,
-    /// Treemap rectangle, set during layout.
+    /// Treemap rectangle, set during layout. Transient — not cached.
+    #[serde(skip)]
     pub rect: NodeRect,
     /// Cached file count (1 for files, sum of children for dirs).
     pub file_count: u32,
@@ -90,7 +93,7 @@ impl FileNode {
 }
 
 /// Aggregated statistics for one file extension across the whole scan.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ExtStat {
     pub ext: Box<str>,
     pub bytes: u64,
@@ -108,6 +111,7 @@ pub struct DirSummary {
 }
 
 /// The complete scanned file tree with precomputed extension statistics.
+#[derive(Serialize, Deserialize)]
 pub struct FileTree {
     pub root: FileNode,
     pub root_path: String,
