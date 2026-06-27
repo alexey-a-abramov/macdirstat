@@ -41,6 +41,21 @@ enum ViewMode {
     Largest,
 }
 
+/// Left-sidebar tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Tree,
+    FileTypes,
+}
+
+/// Sort column for the File Types table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtSort {
+    Name,
+    Count,
+    Size,
+}
+
 struct LoadedState {
     tree: FileTree,
     color_map: ColorMap,
@@ -60,8 +75,11 @@ struct LoadedState {
     view_mode: ViewMode,
     /// Cached "largest folders" ranking, recomputed lazily after tree changes.
     largest: Option<Vec<crate::model::tree::DirSummary>>,
-    /// "All File Types" report popover state.
-    show_all_file_types: bool,
+    /// Left sidebar tab (directory tree vs file-types report).
+    sidebar_tab: SidebarTab,
+    /// File Types table sort column + direction.
+    ext_sort: ExtSort,
+    ext_sort_asc: bool,
     file_types_search: String,
     /// (free, total, volume name) of the scanned volume, for the sidebar bar.
     volume: Option<(u64, u64, String)>,
@@ -100,7 +118,9 @@ fn loaded_state(
         pending_refresh: false,
         view_mode: ViewMode::Treemap,
         largest: None,
-        show_all_file_types: false,
+        sidebar_tab: SidebarTab::Tree,
+        ext_sort: ExtSort::Size,
+        ext_sort_asc: false,
         file_types_search: String::new(),
         volume,
         current_dir: Vec::new(),
@@ -585,7 +605,6 @@ impl LoadedState {
         self.show_status_bar(ctx);
         self.show_tree_panel(ctx);
         self.show_central_panel(ctx);
-        self.show_all_file_types_window(ctx);
         self.show_info_card(ctx);
     }
 
@@ -741,13 +760,136 @@ impl LoadedState {
             )
             .show(ctx, |ui| {
                 show_volume_bar(ui, &self.volume);
-                finder_action =
-                    ui::tree_view::show(ui, &self.tree.root, &mut self.selected, &mut activated);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.sidebar_tab == SidebarTab::Tree, "\u{1F4C1} Tree")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Tree;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.sidebar_tab == SidebarTab::FileTypes,
+                            "\u{1F3F7}\u{FE0F} File Types",
+                        )
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::FileTypes;
+                    }
+                });
+                ui.add_space(4.0);
+                match self.sidebar_tab {
+                    SidebarTab::Tree => {
+                        finder_action = ui::tree_view::show(
+                            ui,
+                            &self.tree.root,
+                            &mut self.selected,
+                            &mut activated,
+                        );
+                    }
+                    SidebarTab::FileTypes => self.show_file_types_tab(ui),
+                }
             });
         if let Some(a) = activated {
             self.activate(a);
         }
         handle_context_action(self, ctx, finder_action);
+    }
+
+    /// File Types tab: a searchable, sortable table of extensions (click a
+    /// column header to sort by name / file count / size).
+    fn show_file_types_tab(&mut self, ui: &mut egui::Ui) {
+        let total = self.tree.root.size.max(1);
+
+        ui.add(
+            egui::TextEdit::singleline(&mut self.file_types_search)
+                .hint_text("Search")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+
+        // Sortable header row.
+        let mut clicked: Option<ExtSort> = None;
+        ui.horizontal(|ui| {
+            let mut header = |ui: &mut egui::Ui, label: &str, col: ExtSort| {
+                let arrow = if self.ext_sort == col {
+                    if self.ext_sort_asc {
+                        " \u{25B2}"
+                    } else {
+                        " \u{25BC}"
+                    }
+                } else {
+                    ""
+                };
+                if ui
+                    .selectable_label(self.ext_sort == col, format!("{label}{arrow}"))
+                    .clicked()
+                {
+                    clicked = Some(col);
+                }
+            };
+            header(ui, "Type", ExtSort::Name);
+            header(ui, "Files", ExtSort::Count);
+            header(ui, "Size", ExtSort::Size);
+        });
+        if let Some(col) = clicked {
+            self.toggle_ext_sort(col);
+        }
+        ui.separator();
+
+        // Filter + sort.
+        let q = self.file_types_search.trim().to_lowercase();
+        let mut rows: Vec<&crate::model::tree::ExtStat> = self
+            .tree
+            .extensions
+            .iter()
+            .filter(|s| q.is_empty() || s.ext.to_lowercase().contains(&q))
+            .collect();
+        match self.ext_sort {
+            ExtSort::Name => rows.sort_by(|a, b| a.ext.cmp(&b.ext)),
+            ExtSort::Count => rows.sort_by_key(|s| s.count),
+            ExtSort::Size => rows.sort_by_key(|s| s.bytes),
+        }
+        if !self.ext_sort_asc {
+            rows.reverse();
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for stat in &rows {
+                    let pct = stat.bytes as f64 / total as f64 * 100.0;
+                    ui.horizontal(|ui| {
+                        let color = self.color_map.get(&stat.ext);
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.5, color);
+                        ui.label(egui::RichText::new(&*stat.ext).size(12.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{pct:.1}%"))
+                                    .size(11.0)
+                                    .color(egui::Color32::GRAY),
+                            );
+                            ui.label(egui::RichText::new(format_size(stat.bytes)).size(11.0));
+                            ui.label(
+                                egui::RichText::new(format_file_count(stat.count))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            );
+                        });
+                    });
+                }
+            });
+    }
+
+    fn toggle_ext_sort(&mut self, col: ExtSort) {
+        if self.ext_sort == col {
+            self.ext_sort_asc = !self.ext_sort_asc;
+        } else {
+            self.ext_sort = col;
+            self.ext_sort_asc = false; // new column defaults to descending
+        }
     }
 
     fn show_central_panel(&mut self, ctx: &egui::Context) {
@@ -844,64 +986,12 @@ impl LoadedState {
                         "All file types".to_string()
                     };
                     if ui.button(label).clicked() {
-                        self.show_all_file_types = true;
+                        self.sidebar_tab = SidebarTab::FileTypes;
                     }
                 });
             });
             ui.add_space(2.0);
         });
-    }
-
-    /// The searchable "All File Types" report popover (counts, sizes, %).
-    fn show_all_file_types_window(&mut self, ctx: &egui::Context) {
-        if !self.show_all_file_types {
-            return;
-        }
-        let total = self.tree.root.size.max(1);
-        let mut open = true;
-        egui::Window::new("All File Types")
-            .open(&mut open)
-            .default_width(440.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.file_types_search)
-                        .hint_text("Search")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                let q = self.file_types_search.trim().to_lowercase();
-                egui::ScrollArea::vertical()
-                    .max_height(440.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("ext_grid")
-                            .num_columns(4)
-                            .striped(true)
-                            .spacing(egui::vec2(14.0, 4.0))
-                            .show(ui, |ui| {
-                                for stat in &self.tree.extensions {
-                                    if !q.is_empty() && !stat.ext.to_lowercase().contains(&q) {
-                                        continue;
-                                    }
-                                    let pct = stat.bytes as f64 / total as f64 * 100.0;
-                                    ui.horizontal(|ui| {
-                                        let color = self.color_map.get(&stat.ext);
-                                        let (dot, _) = ui.allocate_exact_size(
-                                            egui::vec2(10.0, 10.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(dot.center(), 4.0, color);
-                                        ui.label(&*stat.ext);
-                                    });
-                                    ui.label(format!("{} files", format_file_count(stat.count)));
-                                    ui.label(format_size(stat.bytes));
-                                    ui.label(format!("{:.1}%", pct));
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
-        self.show_all_file_types = open;
     }
 
     fn show_breadcrumb(&self, ui: &mut egui::Ui, nav: &mut Option<NavIntent>) {
