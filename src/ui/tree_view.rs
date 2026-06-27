@@ -2,9 +2,9 @@ use std::cell::Cell;
 
 use egui::{Color32, Id, Rect, RichText, pos2, vec2};
 
+use super::ContextAction;
 use crate::format_size;
 use crate::model::tree::{FileNode, TreePath};
-use super::ContextAction;
 
 const MAX_RENDERED_ITEMS: usize = 2000;
 const SIZE_COL_WIDTH: f32 = 55.0;
@@ -30,7 +30,12 @@ pub fn show_branding(ui: &mut egui::Ui) {
     });
 }
 
-pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>) -> Option<(TreePath, ContextAction)> {
+pub fn show(
+    ui: &mut egui::Ui,
+    root: &FileNode,
+    selected: &mut Option<TreePath>,
+    activated: &mut Option<TreePath>,
+) -> Option<(TreePath, ContextAction)> {
     show_branding(ui);
     ui.add_space(4.0);
 
@@ -75,6 +80,7 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
 
     let mut ctx = TreeCtx {
         selected,
+        activated,
         current_path: Vec::new(),
         rendered: 0,
         visible_paths: Vec::new(),
@@ -145,6 +151,7 @@ fn expand_to_path(ctx: &egui::Context, path: &[usize]) {
 
 struct TreeCtx<'a> {
     selected: &'a mut Option<Vec<usize>>,
+    activated: &'a mut Option<Vec<usize>>,
     current_path: Vec<usize>,
     rendered: usize,
     visible_paths: Vec<TreePath>,
@@ -326,6 +333,9 @@ impl<'a> TreeCtx<'a> {
                     if resp.clicked() {
                         *self.selected = Some(path_clone.clone());
                     }
+                    if resp.double_clicked() {
+                        *self.activated = Some(path_clone.clone());
+                    }
                     resp.context_menu(|ui| {
                         if ui.button("Open in Finder").clicked() {
                             action_cell.set(Some(ContextAction::OpenInFinder));
@@ -396,6 +406,9 @@ impl<'a> TreeCtx<'a> {
                 let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
                 if resp.clicked() {
                     *self.selected = Some(self.current_path.clone());
+                }
+                if resp.double_clicked() {
+                    *self.activated = Some(self.current_path.clone());
                 }
                 resp.context_menu(|ui| {
                     if ui.button("Open in Finder").clicked() {

@@ -15,6 +15,7 @@ pub fn show(
     tree: &FileTree,
     dirs: &[DirSummary],
     selected: &mut Option<TreePath>,
+    activated: &mut Option<TreePath>,
 ) {
     ui.add_space(2.0);
     ui.label(
@@ -112,6 +113,9 @@ pub fn show(
 
                 if resp.clicked() {
                     *selected = Some(d.path.clone());
+                }
+                if resp.double_clicked() {
+                    *activated = Some(d.path.clone());
                 }
             }
         });

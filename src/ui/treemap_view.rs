@@ -33,6 +33,7 @@ pub fn show(
     tree: &mut FileTree,
     view_root: &[usize],
     selected: &mut Option<TreePath>,
+    activated: &mut Option<TreePath>,
     color_map: &ColorMap,
     cached_layout_rect: &mut Option<Rect>,
     cached_view_root: &mut Vec<usize>,
@@ -126,25 +127,26 @@ pub fn show(
         }
     }
 
-    // Click a node to select it; click the current view's background to go up.
-    if response.clicked()
-        && let Some(pos) = response.interact_pointer_pos()
-    {
+    // Single click selects; double click navigates (a rect → into it; the
+    // empty background → up one level).
+    if let Some(pos) = response.interact_pointer_pos() {
         let mut rel = Vec::new();
-        if find_node_at(base, pos, &mut rel) {
-            if rel.is_empty() {
-                if !vr.is_empty() {
-                    let parent = &vr[..vr.len() - 1];
-                    *selected = if parent.is_empty() {
-                        None
-                    } else {
-                        Some(parent.to_vec())
-                    };
-                }
-            } else {
-                let mut abs = vr.clone();
-                abs.extend(rel);
-                *selected = Some(abs);
+        let hit = find_node_at(base, pos, &mut rel);
+        let abs = if hit && !rel.is_empty() {
+            let mut a = vr.clone();
+            a.extend(rel);
+            Some(a)
+        } else {
+            None
+        };
+        if response.clicked() {
+            *selected = abs.clone();
+        }
+        if response.double_clicked() {
+            match abs {
+                Some(a) => *activated = Some(a),
+                None if !vr.is_empty() => *activated = Some(vr[..vr.len() - 1].to_vec()),
+                None => {}
             }
         }
     }

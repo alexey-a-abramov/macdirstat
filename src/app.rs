@@ -65,6 +65,76 @@ struct LoadedState {
     file_types_search: String,
     /// (free, total, volume name) of the scanned volume, for the sidebar bar.
     volume: Option<(u64, u64, String)>,
+    /// The navigated folder the right panel + breadcrumb reflect. Distinct from
+    /// `selected` (the highlighted item): single-click selects, double-click
+    /// navigates here.
+    current_dir: TreePath,
+    /// Back/forward history of `current_dir`.
+    history: Vec<TreePath>,
+    history_pos: usize,
+}
+
+/// A navigation request collected during rendering and applied afterwards.
+#[derive(Clone)]
+enum NavIntent {
+    Back,
+    Forward,
+    SetDir(TreePath),
+    Rescan(PathBuf),
+}
+
+impl LoadedState {
+    /// Navigate the right panel/breadcrumb to `dir`, recording history.
+    fn navigate_to(&mut self, dir: TreePath) {
+        if dir == self.current_dir {
+            return;
+        }
+        self.history.truncate(self.history_pos + 1);
+        self.history.push(dir.clone());
+        self.history_pos = self.history.len() - 1;
+        self.set_dir(dir);
+    }
+
+    fn go_back(&mut self) {
+        if self.history_pos > 0 {
+            self.history_pos -= 1;
+            self.set_dir(self.history[self.history_pos].clone());
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if self.history_pos + 1 < self.history.len() {
+            self.history_pos += 1;
+            self.set_dir(self.history[self.history_pos].clone());
+        }
+    }
+
+    /// Set `current_dir` and invalidate the treemap layout so it re-roots.
+    fn set_dir(&mut self, dir: TreePath) {
+        self.current_dir = dir;
+        self.cached_layout_rect = None;
+        self.cached_view_root.clear();
+    }
+
+    fn apply_nav(&mut self, n: NavIntent) {
+        match n {
+            NavIntent::Back => self.go_back(),
+            NavIntent::Forward => self.go_forward(),
+            NavIntent::SetDir(d) => self.navigate_to(d),
+            NavIntent::Rescan(p) => self.pending_scan = Some(p),
+        }
+    }
+
+    /// Double-clicking `path`: navigate into a folder, or to a file's parent.
+    fn activate(&mut self, path: TreePath) {
+        let target = match self.tree.root.resolve_path(&path) {
+            Some(n) if n.is_dir => path.clone(),
+            Some(_) => path[..path.len().saturating_sub(1)].to_vec(),
+            None => return,
+        };
+        self.selected = Some(path);
+        self.navigate_to(target);
+    }
 }
 
 impl App {
@@ -287,6 +357,9 @@ impl eframe::App for App {
                 show_all_file_types: false,
                 file_types_search: String::new(),
                 volume,
+                current_dir: Vec::new(),
+                history: vec![Vec::new()],
+                history_pos: 0,
             }));
         }
 
@@ -491,6 +564,57 @@ impl LoadedState {
         self.show_tree_panel(ctx);
         self.show_central_panel(ctx);
         self.show_all_file_types_window(ctx);
+        self.show_info_card(ctx);
+    }
+
+    /// Floating info card for the selected item (single-click selects → shows this).
+    fn show_info_card(&self, ctx: &egui::Context) {
+        let Some(sel) = self.selected.as_ref() else {
+            return;
+        };
+        let Some(node) = self.tree.root.resolve_path(sel) else {
+            return;
+        };
+        let path = self
+            .tree
+            .build_fs_path(sel)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        egui::Area::new("info_card".into())
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -64.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        ui.strong(&*node.name);
+                        ui.label(format_size(node.size));
+                        if node.is_dir {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} files \u{2022} {} folders",
+                                    format_file_count(node.file_count as u64),
+                                    format_file_count(node.dir_count as u64),
+                                ))
+                                .color(egui::Color32::GRAY),
+                            );
+                        } else {
+                            let ext = node.extension();
+                            let kind = if ext.is_empty() {
+                                "File".to_string()
+                            } else {
+                                format!(".{ext} file")
+                            };
+                            ui.label(egui::RichText::new(kind).color(egui::Color32::GRAY));
+                        }
+                        ui.label(
+                            egui::RichText::new(path)
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                        );
+                    });
+            });
     }
 
     fn show_status_bar(&mut self, ctx: &egui::Context) {
@@ -576,6 +700,7 @@ impl LoadedState {
 
     fn show_tree_panel(&mut self, ctx: &egui::Context) {
         let mut finder_action = None;
+        let mut activated: Option<TreePath> = None;
         egui::SidePanel::left("tree_view")
             .default_width(300.0)
             .min_width(250.0)
@@ -586,27 +711,32 @@ impl LoadedState {
             )
             .show(ctx, |ui| {
                 show_volume_bar(ui, &self.volume);
-                finder_action = ui::tree_view::show(ui, &self.tree.root, &mut self.selected);
+                finder_action =
+                    ui::tree_view::show(ui, &self.tree.root, &mut self.selected, &mut activated);
             });
+        if let Some(a) = activated {
+            self.activate(a);
+        }
         handle_context_action(self, ctx, finder_action);
     }
 
     fn show_central_panel(&mut self, ctx: &egui::Context) {
+        // A delete can reindex siblings and leave current_dir dangling.
+        if self.tree.root.resolve_path(&self.current_dir).is_none() {
+            self.set_dir(Vec::new());
+        }
         let mut finder_action = None;
+        let mut activated: Option<TreePath> = None;
+        let mut nav: Option<NavIntent> = None;
+        // The right panel roots at the navigated folder, not the selection.
+        let view_root = self.current_dir.clone();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tree.permission_denied > 0 {
                 show_permission_banner(ui, self.tree.permission_denied);
             }
-            let mut new_scan_path: Option<PathBuf> = None;
-            self.show_breadcrumb(ui, &mut new_scan_path);
-            ui.add_space(2.0);
-            if let Some(path) = new_scan_path {
-                self.pending_scan = Some(path);
-            }
-
-            // The right panel follows the selection: a folder shows its own
-            // contents, a file shows its parent folder.
-            let view_root = derived_view_root(&self.tree, &self.selected);
+            self.show_breadcrumb(ui, &mut nav);
+            ui.add_space(4.0);
 
             match self.view_mode {
                 ViewMode::Treemap => {
@@ -615,6 +745,7 @@ impl LoadedState {
                         &mut self.tree,
                         &view_root,
                         &mut self.selected,
+                        &mut activated,
                         &self.color_map,
                         &mut self.cached_layout_rect,
                         &mut self.cached_view_root,
@@ -627,6 +758,7 @@ impl LoadedState {
                         &self.tree,
                         &view_root,
                         &mut self.selected,
+                        &mut activated,
                         &self.color_map,
                     );
                 }
@@ -635,11 +767,24 @@ impl LoadedState {
                         self.largest = Some(self.tree.largest_directories(200));
                     }
                     if let Some(dirs) = self.largest.as_ref() {
-                        ui::largest_view::show(ui, &self.tree, dirs, &mut self.selected);
+                        ui::largest_view::show(
+                            ui,
+                            &self.tree,
+                            dirs,
+                            &mut self.selected,
+                            &mut activated,
+                        );
                     }
                 }
             }
         });
+
+        if let Some(a) = activated {
+            self.activate(a);
+        }
+        if let Some(n) = nav {
+            self.apply_nav(n);
+        }
         handle_context_action(self, ctx, finder_action);
     }
 
@@ -729,54 +874,125 @@ impl LoadedState {
         self.show_all_file_types = open;
     }
 
-    fn show_breadcrumb(&self, ui: &mut egui::Ui, new_scan_path: &mut Option<PathBuf>) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            let segments: Vec<&str> = self
-                .tree
-                .root_path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect();
-            let last_idx = segments.len().saturating_sub(1);
+    fn show_breadcrumb(&self, ui: &mut egui::Ui, nav: &mut Option<NavIntent>) {
+        // Full path crumbs: volume → … → current_dir leaf. Segments at/below the
+        // scan root navigate in-tree (SetDir); segments above it rescan.
+        let root_components: Vec<&str> = self
+            .tree
+            .root_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let root_depth = root_components.len();
 
-            let separator = |ui: &mut egui::Ui| {
-                ui.label(
-                    egui::RichText::new(" \u{203A} ")
-                        .size(13.0)
-                        .color(egui::Color32::GRAY),
-                );
+        let mut current_names: Vec<String> = Vec::new();
+        let mut node = &self.tree.root;
+        for &i in &self.current_dir {
+            match node.children.get(i) {
+                Some(c) => {
+                    current_names.push(c.name.to_string());
+                    node = c;
+                }
+                None => break,
+            }
+        }
+
+        let all: Vec<String> = root_components
+            .iter()
+            .map(|s| s.to_string())
+            .chain(current_names)
+            .collect();
+
+        let vol_name = self
+            .volume
+            .as_ref()
+            .map(|(_, _, n)| n.clone())
+            .unwrap_or_else(|| "Macintosh HD".to_string());
+
+        let mut crumbs: Vec<(String, NavIntent)> = Vec::with_capacity(all.len() + 1);
+        crumbs.push((
+            vol_name,
+            if root_depth == 0 {
+                NavIntent::SetDir(Vec::new())
+            } else {
+                NavIntent::Rescan(PathBuf::from("/"))
+            },
+        ));
+        for k in 1..=all.len() {
+            let action = if k >= root_depth {
+                NavIntent::SetDir(self.current_dir[..(k - root_depth)].to_vec())
+            } else {
+                let mut p = PathBuf::from("/");
+                for c in &all[0..k] {
+                    p.push(c);
+                }
+                NavIntent::Rescan(p)
             };
+            crumbs.push((all[k - 1].clone(), action));
+        }
 
-            ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
+        let n = crumbs.len();
+        // Elide the middle: first › … › last three.
+        let indices: Vec<Option<usize>> = if n > 5 {
+            vec![Some(0), None, Some(n - 3), Some(n - 2), Some(n - 1)]
+        } else {
+            (0..n).map(Some).collect()
+        };
 
-            // "Macintosh HD" navigates to the volume root.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+
+            let can_back = self.history_pos > 0;
+            let can_fwd = self.history_pos + 1 < self.history.len();
             if ui
-                .link(egui::RichText::new("Macintosh HD").size(13.0))
-                .on_hover_text("Scan /")
+                .add_enabled(can_back, egui::Button::new("\u{25C0}").small())
+                .on_hover_text("Back")
                 .clicked()
             {
-                *new_scan_path = Some(PathBuf::from("/"));
+                *nav = Some(NavIntent::Back);
             }
-            if !segments.is_empty() {
-                separator(ui);
+            if ui
+                .add_enabled(can_fwd, egui::Button::new("\u{25B6}").small())
+                .on_hover_text("Forward")
+                .clicked()
+            {
+                *nav = Some(NavIntent::Forward);
             }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
 
-            // Each segment is a clickable crumb that rescans that ancestor.
-            // The final segment is the current location: bold, not a link.
-            for (i, seg) in segments.iter().enumerate() {
-                if i == last_idx {
-                    let blue = egui::Color32::from_rgb(56, 132, 244);
-                    ui.label(egui::RichText::new(*seg).size(14.0).strong().color(blue));
-                } else {
-                    if ui.link(egui::RichText::new(*seg).size(13.0)).clicked() {
-                        let mut path = PathBuf::from("/");
-                        for ancestor in &segments[..=i] {
-                            path.push(ancestor);
-                        }
-                        *new_scan_path = Some(path);
+            for (pos, idx_opt) in indices.iter().enumerate() {
+                if pos > 0 {
+                    ui.label(
+                        egui::RichText::new(" \u{203A} ")
+                            .size(13.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                match idx_opt {
+                    None => {
+                        ui.label(
+                            egui::RichText::new("\u{2026}")
+                                .size(13.0)
+                                .color(egui::Color32::GRAY),
+                        );
                     }
-                    separator(ui);
+                    Some(idx) => {
+                        let is_last = *idx == n - 1;
+                        if is_last {
+                            ui.label(
+                                egui::RichText::new(&crumbs[*idx].0)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(56, 132, 244)),
+                            );
+                        } else if ui
+                            .link(egui::RichText::new(&crumbs[*idx].0).size(13.0))
+                            .clicked()
+                        {
+                            *nav = Some(crumbs[*idx].1.clone());
+                        }
+                    }
                 }
             }
         });
@@ -1256,21 +1472,6 @@ fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
         receiver: rx,
         progress,
         cancel,
-    }
-}
-
-/// The directory scanned at startup when no path is given on the command line.
-/// The folder the right-hand view should show, given the current selection:
-/// a selected directory shows its own contents; a selected file shows its
-/// parent folder; no selection shows the scan root.
-fn derived_view_root(tree: &FileTree, selected: &Option<TreePath>) -> TreePath {
-    match selected {
-        None => Vec::new(),
-        Some(p) => match tree.root.resolve_path(p) {
-            Some(n) if n.is_dir => p.clone(),
-            Some(_) => p[..p.len().saturating_sub(1)].to_vec(),
-            None => Vec::new(),
-        },
     }
 }
 

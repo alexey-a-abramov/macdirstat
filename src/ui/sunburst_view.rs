@@ -31,6 +31,7 @@ pub fn show(
     tree: &FileTree,
     view_root: &[usize],
     selected: &mut Option<TreePath>,
+    activated: &mut Option<TreePath>,
     color_map: &ColorMap,
 ) {
     let available = ui.available_size();
@@ -125,21 +126,26 @@ pub fn show(
         }
     }
 
-    // Click: a segment navigates in; the center navigates up one level.
-    if response.clicked()
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        if center.distance(pos) <= r0 {
-            if !view_root.is_empty() {
-                let parent = &view_root[..view_root.len() - 1];
-                *selected = if parent.is_empty() {
-                    None
-                } else {
-                    Some(parent.to_vec())
-                };
-            }
-        } else if let Some(i) = hit_test(pos, center, r0, ring_w, &segs) {
+    // Single click selects a segment; double click navigates (a segment → into
+    // it; the center → up one level).
+    if let Some(pos) = response.interact_pointer_pos() {
+        let on_center = center.distance(pos) <= r0;
+        let seg = if on_center {
+            None
+        } else {
+            hit_test(pos, center, r0, ring_w, &segs)
+        };
+        if response.clicked()
+            && let Some(i) = seg
+        {
             *selected = Some(segs[i].path.clone());
+        }
+        if response.double_clicked() {
+            if let Some(i) = seg {
+                *activated = Some(segs[i].path.clone());
+            } else if on_center && !view_root.is_empty() {
+                *activated = Some(view_root[..view_root.len() - 1].to_vec());
+            }
         }
     }
 }
