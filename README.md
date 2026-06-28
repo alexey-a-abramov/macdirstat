@@ -24,6 +24,19 @@ Requires Rust (2024 edition). macOS only — uses platform-specific APIs for fas
 cargo build --release
 ```
 
+### Installable app bundle
+
+To build a double-clickable `MacDirStat.app` you can drag into `/Applications`:
+
+```sh
+./scripts/bundle-mac.sh
+cp -R target/release/bundle/MacDirStat.app /Applications/
+```
+
+The bundle is ad-hoc code-signed, so on first launch right-click → **Open** once.
+To let it scan protected locations, add it under **System Settings → Privacy &
+Security → Full Disk Access**.
+
 ## Usage
 
 ```sh
