@@ -14,7 +14,7 @@ use crate::model::tree::FileTree;
 
 /// Bump when the serialized shape of `FileTree`/`FileNode` changes — old caches
 /// then fail the version check and are ignored (a fresh scan rewrites them).
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("macdirstat"))

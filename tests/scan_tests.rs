@@ -101,11 +101,19 @@ fn min_file_size_filter_excludes_small_files() {
     let full = scan(&root, true, 0);
     assert_eq!(full.root.file_count, 2);
     assert_eq!(full.root.size, 10_100);
+    assert!(
+        !full.size_approximate,
+        "an unfiltered scan reports exact sizes"
+    );
 
     // Floor at 1000 bytes: only big.dat survives.
     let filtered = scan(&root, true, 1000);
     assert_eq!(filtered.root.file_count, 1, "tiny file filtered out");
     assert_eq!(filtered.root.size, 10_000);
+    assert!(
+        filtered.size_approximate,
+        "a size-floored scan flags totals as approximate"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -149,6 +157,10 @@ fn excluded_paths_are_skipped() {
 
     assert_eq!(tree.root.file_count, 1, "only keep.dat counted");
     assert_eq!(tree.root.size, 100);
+    assert!(
+        tree.size_approximate,
+        "skipping an excluded folder makes totals approximate"
+    );
 
     fs::remove_dir_all(&root).ok();
 }

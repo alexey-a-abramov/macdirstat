@@ -797,11 +797,16 @@ impl LoadedState {
                 ui.add_space(4.0);
                 match self.sidebar_tab {
                     SidebarTab::Tree => {
+                        // Directory totals are lower bounds when the scan filtered
+                        // content out or was stopped — the tree marks them with "~".
+                        let approximate = self.tree.size_approximate || self.partial;
                         finder_action = ui::tree_view::show(
                             ui,
                             &self.tree.root,
                             &mut self.selected,
                             &mut activated,
+                            &self.current_dir,
+                            approximate,
                         );
                     }
                     SidebarTab::FileTypes => self.show_file_types_tab(ui),

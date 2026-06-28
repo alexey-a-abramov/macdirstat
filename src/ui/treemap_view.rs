@@ -187,10 +187,18 @@ pub fn show(
     {
         let r = to_egui_rect(&node.rect);
         if r.width() > 0.0 && r.height() > 0.0 {
+            // Dark halo under a bright line so the highlight reads on any cushion
+            // colour — this is how a tree selection shows up in the rectangle view.
             painter.rect_stroke(
                 r,
                 0.0,
-                egui::Stroke::new(2.0, Color32::WHITE),
+                egui::Stroke::new(3.5, Color32::from_black_alpha(180)),
+                egui::StrokeKind::Outside,
+            );
+            painter.rect_stroke(
+                r,
+                0.0,
+                egui::Stroke::new(1.8, Color32::WHITE),
                 egui::StrokeKind::Outside,
             );
         }

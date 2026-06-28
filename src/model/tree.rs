@@ -129,6 +129,10 @@ pub struct FileTree {
     /// Directories that could not be opened during the scan (usually because the
     /// app lacks Full Disk Access). Their contents are missing from the totals.
     pub permission_denied: u64,
+    /// True when directory totals are lower bounds rather than exact: the scan
+    /// skipped small files (optimization mode), skipped excluded/cloud folders,
+    /// or hit unreadable directories. The UI marks affected sizes with a "~".
+    pub size_approximate: bool,
 }
 
 /// Scan-wide options and mutable state shared across threads.
@@ -144,6 +148,8 @@ struct ScanCtx {
     seen_files: Mutex<FxHashSet<(u32, u64)>>,
     /// Count of directories that could not be opened (permission denied, etc.).
     denied: AtomicU64,
+    /// Set once any directory was skipped because it matched the exclusion list.
+    excluded_hit: AtomicBool,
 }
 
 impl ScanCtx {
@@ -155,6 +161,7 @@ impl ScanCtx {
             seen_dirs: Mutex::new(FxHashSet::default()),
             seen_files: Mutex::new(FxHashSet::default()),
             denied: AtomicU64::new(0),
+            excluded_hit: AtomicBool::new(false),
         }
     }
 
@@ -251,11 +258,19 @@ impl FileTree {
             .collect();
         extensions.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
 
+        let permission_denied = ctx.denied.load(Ordering::Relaxed);
+        // Sizes are lower bounds whenever the scan deliberately left content out:
+        // a small-file floor, an excluded/cloud subtree, or an unreadable folder.
+        let size_approximate = min_file_size_bytes > 0
+            || ctx.excluded_hit.load(Ordering::Relaxed)
+            || permission_denied > 0;
+
         FileTree {
             root: root_node,
             root_path: root.display().to_string(),
             extensions,
-            permission_denied: ctx.denied.load(Ordering::Relaxed),
+            permission_denied,
+            size_approximate,
         }
     }
 
@@ -626,6 +641,7 @@ fn build_node_fd(
             if let Some(ref parent) = current_abs_path {
                 let child_path = parent.join(&*entry.name);
                 if excluded.iter().any(|excl| child_path == *excl) {
+                    ctx.excluded_hit.store(true, Ordering::Relaxed);
                     continue;
                 }
             }

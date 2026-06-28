@@ -30,13 +30,28 @@ pub fn show_branding(ui: &mut egui::Ui) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     root: &FileNode,
     selected: &mut Option<TreePath>,
     activated: &mut Option<TreePath>,
+    current_dir: &[usize],
+    approximate: bool,
 ) -> Option<(TreePath, ContextAction)> {
     show_branding(ui);
+    if approximate {
+        ui.label(
+            RichText::new("\u{2248} sizes are approximate")
+                .small()
+                .color(Color32::from_gray(140)),
+        )
+        .on_hover_text(
+            "Some content was left out of the totals \u{2014} small files below the optimization \
+             threshold, skipped cloud/excluded folders, unreadable folders, or a stopped scan. \
+             Directory sizes shown here are lower bounds.",
+        );
+    }
     ui.add_space(4.0);
 
     // Expand ancestors and scroll only when selection changes (not every frame,
@@ -51,6 +66,28 @@ pub fn show(
         ui.ctx()
             .data_mut(|d| d.insert_temp(last_expanded_id, selected.clone()));
     }
+
+    // Keep the tree in sync with the right-panel/treemap root: whenever the
+    // navigated directory changes (double-click, breadcrumb, back/forward),
+    // expand down to *and into* that folder so the same level is visible here.
+    let last_nav_id = Id::new("tree_last_nav");
+    let last_nav: Option<Vec<usize>> = ui.ctx().data_mut(|d| d.get_temp(last_nav_id));
+    let nav_changed = last_nav.as_deref() != Some(current_dir);
+    if nav_changed {
+        expand_including_path(ui.ctx(), current_dir);
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(last_nav_id, current_dir.to_vec()));
+    }
+
+    // Scroll the changed item into view. A selection change is the more specific
+    // intent (single-click reveal), so it wins; otherwise follow navigation.
+    let scroll_target: Option<TreePath> = if selection_changed {
+        selected.clone()
+    } else if nav_changed {
+        Some(current_dir.to_vec())
+    } else {
+        None
+    };
 
     // Rounded-corner container for the tree (Finder/System Settings style)
     let frame_fill = if ui.visuals().dark_mode {
@@ -90,6 +127,8 @@ pub fn show(
         scroll_right: 0.0,
         frame_left: 0.0,
         context_action: None,
+        approximate,
+        scroll_target,
     };
 
     let available_height = ui.available_height();
@@ -149,6 +188,19 @@ fn expand_to_path(ctx: &egui::Context, path: &[usize]) {
     }
 }
 
+/// Like `expand_to_path`, but also opens the node *itself* so its children are
+/// shown — used to mirror the right panel re-rooting into a navigated folder.
+fn expand_including_path(ctx: &egui::Context, path: &[usize]) {
+    for depth in 0..=path.len() {
+        let prefix = &path[..depth];
+        let id = Id::new(("tree", prefix));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, false);
+        state.set_open(true);
+        state.store(ctx);
+    }
+}
+
 struct TreeCtx<'a> {
     selected: &'a mut Option<Vec<usize>>,
     activated: &'a mut Option<Vec<usize>>,
@@ -161,6 +213,10 @@ struct TreeCtx<'a> {
     scroll_right: f32,
     frame_left: f32,
     context_action: Option<(TreePath, ContextAction)>,
+    /// Directory sizes are lower bounds — prefix them with "~".
+    approximate: bool,
+    /// Row to scroll into view this frame (selection or navigation target).
+    scroll_target: Option<TreePath>,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -187,10 +243,15 @@ impl<'a> TreeCtx<'a> {
     }
 
     /// Paint the size text at the right edge. Bold+black when selected.
+    /// `approx` prepends "~" to flag a lower-bound directory total.
     /// No background overlay — name text fading is handled at render time
     /// via foreground alpha (see `paint_name_faded`).
-    fn paint_size(&self, ui: &egui::Ui, y_center: f32, size: u64, is_selected: bool) {
-        let size_str = format_size(size);
+    fn paint_size(&self, ui: &egui::Ui, y_center: f32, size: u64, is_selected: bool, approx: bool) {
+        let size_str = if approx {
+            format!("~{}", format_size(size))
+        } else {
+            format_size(size)
+        };
         let color = if is_selected {
             Color32::BLACK
         } else {
@@ -298,6 +359,15 @@ impl<'a> TreeCtx<'a> {
 
         let y_before = ui.cursor().min.y;
 
+        // Scroll this row into view when it's the selection/navigation target
+        // (e.g. the user clicked a rectangle in the treemap). `None` alignment
+        // scrolls the minimum needed, so already-visible rows don't jump.
+        if self.scroll_target.as_ref() == Some(&self.current_path) {
+            let width = self.scroll_right - self.frame_left;
+            let row_rect = Rect::from_min_size(pos2(self.frame_left, y_before), vec2(width, 20.0));
+            ui.scroll_to_rect(row_rect, None);
+        }
+
         if node.is_dir && !node.children.is_empty() {
             let id = Id::new(("tree", self.current_path.as_slice()));
             let default_open = depth < 1;
@@ -377,7 +447,13 @@ impl<'a> TreeCtx<'a> {
                 &name_owned,
                 is_sel,
             );
-            self.paint_size(ui, header_row_y + 10.0, node.size, is_sel);
+            self.paint_size(
+                ui,
+                header_row_y + 10.0,
+                node.size,
+                is_sel,
+                self.approximate && node.is_dir && node.size > 0,
+            );
 
             if let Some(action) = action_cell.into_inner() {
                 self.context_action = Some((path_clone, action));
@@ -438,7 +514,13 @@ impl<'a> TreeCtx<'a> {
                 display_name,
                 is_selected,
             );
-            self.paint_size(ui, y_before + 10.0, node.size, is_selected);
+            self.paint_size(
+                ui,
+                y_before + 10.0,
+                node.size,
+                is_selected,
+                self.approximate && node.is_dir && node.size > 0,
+            );
         }
     }
 }
