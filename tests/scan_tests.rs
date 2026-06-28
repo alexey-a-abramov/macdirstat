@@ -273,6 +273,43 @@ fn largest_directories_ranks_by_size() {
 }
 
 #[test]
+fn folders_by_extension_ranks_and_matches() {
+    let root = temp_dir("extfilter");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    write_file(&root.join("a/big.raw"), 10_000);
+    write_file(&root.join("a/small.txt"), 10);
+    write_file(&root.join("b/mid.raw"), 3_000);
+    write_file(&root.join("b/data"), 50); // extensionless, in subfolder b
+    write_file(&root.join("noext"), 7); // extensionless, in root (not a subfolder)
+
+    let tree = scan(&root, true, 0);
+
+    // .raw lives in a (10000) and b (3000), ranked by bytes descending.
+    let raw = tree.folders_by_extension("raw", 10);
+    assert_eq!(raw.len(), 2);
+    assert_eq!(&*raw[0].name, "a");
+    assert_eq!((raw[0].ext_bytes, raw[0].ext_count), (10_000, 1));
+    assert_eq!(&*raw[1].name, "b");
+    assert_eq!(raw[1].ext_bytes, 3_000);
+
+    // .txt only in a.
+    let txt = tree.folders_by_extension("txt", 10);
+    assert_eq!(txt.len(), 1);
+    assert_eq!(&*txt[0].name, "a");
+    assert_eq!(txt[0].ext_bytes, 10);
+
+    // The (no ext) sentinel matches extensionless files; only b/data is in a
+    // subfolder (root's `noext` lives in the root, which isn't listed).
+    let none = tree.folders_by_extension("(no ext)", 10);
+    assert_eq!(none.len(), 1);
+    assert_eq!(&*none[0].name, "b");
+    assert_eq!(none[0].ext_bytes, 50);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn cache_save_load_roundtrip() {
     let root = temp_dir("cache");
     write_file(&root.join("a.txt"), 10);

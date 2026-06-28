@@ -110,6 +110,15 @@ pub struct DirSummary {
     pub dir_count: u32,
 }
 
+/// A directory's total for one file extension, used by the "filter by type" view.
+#[derive(Clone)]
+pub struct ExtDirSummary {
+    pub path: TreePath,
+    pub name: Box<str>,
+    pub ext_bytes: u64,
+    pub ext_count: u64,
+}
+
 /// The complete scanned file tree with precomputed extension statistics.
 #[derive(Serialize, Deserialize)]
 pub struct FileTree {
@@ -332,6 +341,18 @@ impl FileTree {
         dirs
     }
 
+    /// Folders that contain files of `ext`, ranked by how many bytes of that
+    /// extension live under each (descending). Pass the `(no ext)` sentinel to
+    /// match extensionless files. Powers the "filter by file type" view.
+    pub fn folders_by_extension(&self, ext: &str, limit: usize) -> Vec<ExtDirSummary> {
+        let mut out: Vec<ExtDirSummary> = Vec::new();
+        let mut path: Vec<usize> = Vec::new();
+        collect_ext_dirs(&self.root, ext, &mut path, &mut out);
+        out.sort_unstable_by_key(|d| std::cmp::Reverse(d.ext_bytes));
+        out.truncate(limit);
+        out
+    }
+
     /// Incremental refresh: walk the existing tree, drop nodes that no longer
     /// exist on disk, update file sizes for those that do, and re-sort every
     /// directory. Much faster than a full rescan when most content is unchanged
@@ -407,6 +428,53 @@ fn collect_dirs(node: &FileNode, path: &mut Vec<usize>, out: &mut Vec<DirSummary
             path.pop();
         }
     }
+}
+
+/// True if `node` is a file whose extension is `ext` (`(no ext)` matches
+/// extensionless files).
+fn file_matches_ext(node: &FileNode, ext: &str) -> bool {
+    if node.is_dir {
+        return false;
+    }
+    let e = node.extension();
+    if ext == "(no ext)" {
+        e.is_empty()
+    } else {
+        e == ext
+    }
+}
+
+/// Accumulate per-directory totals for `ext`. Returns this subtree's (bytes,
+/// count) of matching files and records every directory that contains any.
+fn collect_ext_dirs(
+    node: &FileNode,
+    ext: &str,
+    path: &mut Vec<usize>,
+    out: &mut Vec<ExtDirSummary>,
+) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    for (i, child) in node.children.iter().enumerate() {
+        if child.is_dir {
+            path.push(i);
+            let (b, c) = collect_ext_dirs(child, ext, path, out);
+            if b > 0 {
+                out.push(ExtDirSummary {
+                    path: path.clone(),
+                    name: child.name.clone(),
+                    ext_bytes: b,
+                    ext_count: c,
+                });
+            }
+            path.pop();
+            bytes += b;
+            count += c;
+        } else if file_matches_ext(child, ext) {
+            bytes += child.size;
+            count += 1;
+        }
+    }
+    (bytes, count)
 }
 
 /// Recursively refresh a directory node using an already-open fd.

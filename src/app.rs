@@ -75,6 +75,10 @@ struct LoadedState {
     view_mode: ViewMode,
     /// Cached "largest folders" ranking, recomputed lazily after tree changes.
     largest: Option<Vec<crate::model::tree::DirSummary>>,
+    /// Active "filter by file type" extension, and its per-folder ranking cache.
+    /// When set, the right panel lists the folders containing that type.
+    filter_ext: Option<String>,
+    ext_folders: Option<Vec<crate::model::tree::ExtDirSummary>>,
     /// Left sidebar tab (directory tree vs file-types report).
     sidebar_tab: SidebarTab,
     /// File Types table sort column + direction.
@@ -118,6 +122,8 @@ fn loaded_state(
         pending_refresh: false,
         view_mode: ViewMode::Treemap,
         largest: None,
+        filter_ext: None,
+        ext_folders: None,
         sidebar_tab: SidebarTab::Tree,
         ext_sort: ExtSort::Size,
         ext_sort_asc: false,
@@ -173,6 +179,7 @@ impl LoadedState {
     }
 
     fn apply_nav(&mut self, n: NavIntent) {
+        self.clear_filter(); // navigating exits the file-type filter
         match n {
             NavIntent::Back => self.go_back(),
             NavIntent::Forward => self.go_forward(),
@@ -189,7 +196,14 @@ impl LoadedState {
             None => return,
         };
         self.selected = Some(path);
+        self.clear_filter(); // navigating exits the file-type filter
         self.navigate_to(target);
+    }
+
+    /// Exit the active file-type filter, if any.
+    fn clear_filter(&mut self) {
+        self.filter_ext = None;
+        self.ext_folders = None;
     }
 }
 
@@ -337,6 +351,9 @@ impl App {
         }
         if let (Some(m), AppState::Loaded(loaded)) = (set_mode, &mut self.state) {
             loaded.view_mode = m;
+            // Choosing a visualization exits the file-type filter.
+            loaded.filter_ext = None;
+            loaded.ext_folders = None;
         }
         if quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -854,17 +871,23 @@ impl LoadedState {
             rows.reverse();
         }
 
+        let mut clicked_ext: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 for stat in &rows {
                     let pct = stat.bytes as f64 / total as f64 * 100.0;
-                    ui.horizontal(|ui| {
+                    let is_filter = self.filter_ext.as_deref() == Some(&*stat.ext);
+                    let row = ui.horizontal(|ui| {
                         let color = self.color_map.get(&stat.ext);
                         let (dot, _) =
                             ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                         ui.painter().circle_filled(dot.center(), 3.5, color);
-                        ui.label(egui::RichText::new(&*stat.ext).size(12.0));
+                        let mut name = egui::RichText::new(&*stat.ext).size(12.0);
+                        if is_filter {
+                            name = name.strong().color(egui::Color32::from_rgb(56, 132, 244));
+                        }
+                        ui.label(name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 egui::RichText::new(format!("{pct:.1}%"))
@@ -879,8 +902,21 @@ impl LoadedState {
                             );
                         });
                     });
+                    if row
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_text("Show folders containing this type")
+                        .clicked()
+                    {
+                        clicked_ext = Some(stat.ext.to_string());
+                    }
                 }
             });
+
+        if let Some(ext) = clicked_ext {
+            self.filter_ext = Some(ext);
+            self.ext_folders = None; // recompute for the new extension
+        }
     }
 
     fn toggle_ext_sort(&mut self, col: ExtSort) {
@@ -897,9 +933,19 @@ impl LoadedState {
         if self.tree.root.resolve_path(&self.current_dir).is_none() {
             self.set_dir(Vec::new());
         }
+        // Recompute the per-folder ranking when a file-type filter is active
+        // (cached until the filter or tree changes — no per-frame walk or clone).
+        if self.ext_folders.is_none()
+            && let Some(ext) = self.filter_ext.as_deref()
+        {
+            let folders = self.tree.folders_by_extension(ext, 300);
+            self.ext_folders = Some(folders);
+        }
+
         let mut finder_action = None;
         let mut activated: Option<TreePath> = None;
         let mut nav: Option<NavIntent> = None;
+        let mut clear_requested = false;
         // The right panel roots at the navigated folder, not the selection.
         let view_root = self.current_dir.clone();
 
@@ -910,47 +956,72 @@ impl LoadedState {
             self.show_breadcrumb(ui, &mut nav);
             ui.add_space(4.0);
 
-            match self.view_mode {
-                ViewMode::Treemap => {
-                    finder_action = ui::treemap_view::show(
-                        ui,
-                        &mut self.tree,
-                        &view_root,
-                        &mut self.selected,
-                        &mut activated,
-                        &self.color_map,
-                        &mut self.cached_layout_rect,
-                        &mut self.cached_view_root,
-                        &mut self.treemap_texture,
+            if let Some(ext) = self.filter_ext.as_deref() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("\u{1F3F7}\u{FE0F} Folders containing {ext}"))
+                            .strong(),
                     );
-                }
-                ViewMode::Sunburst => {
-                    ui::sunburst_view::show(
+                    if ui.button("\u{2715} Clear filter").clicked() {
+                        clear_requested = true;
+                    }
+                });
+                ui.add_space(4.0);
+                if let Some(dirs) = self.ext_folders.as_ref() {
+                    ui::largest_view::show_ext_folders(
                         ui,
                         &self.tree,
-                        &view_root,
+                        dirs,
                         &mut self.selected,
                         &mut activated,
-                        &self.color_map,
                     );
                 }
-                ViewMode::Largest => {
-                    if self.largest.is_none() {
-                        self.largest = Some(self.tree.largest_directories(200));
-                    }
-                    if let Some(dirs) = self.largest.as_ref() {
-                        ui::largest_view::show(
+            } else {
+                match self.view_mode {
+                    ViewMode::Treemap => {
+                        finder_action = ui::treemap_view::show(
                             ui,
-                            &self.tree,
-                            dirs,
+                            &mut self.tree,
+                            &view_root,
                             &mut self.selected,
                             &mut activated,
+                            &self.color_map,
+                            &mut self.cached_layout_rect,
+                            &mut self.cached_view_root,
+                            &mut self.treemap_texture,
                         );
+                    }
+                    ViewMode::Sunburst => {
+                        ui::sunburst_view::show(
+                            ui,
+                            &self.tree,
+                            &view_root,
+                            &mut self.selected,
+                            &mut activated,
+                            &self.color_map,
+                        );
+                    }
+                    ViewMode::Largest => {
+                        if self.largest.is_none() {
+                            self.largest = Some(self.tree.largest_directories(200));
+                        }
+                        if let Some(dirs) = self.largest.as_ref() {
+                            ui::largest_view::show(
+                                ui,
+                                &self.tree,
+                                dirs,
+                                &mut self.selected,
+                                &mut activated,
+                            );
+                        }
                     }
                 }
             }
         });
 
+        if clear_requested {
+            self.clear_filter();
+        }
         if let Some(a) = activated {
             self.activate(a);
         }
@@ -1200,6 +1271,7 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
             loaded.cached_view_root.clear();
             loaded.treemap_texture = None;
             loaded.largest = None; // ranking is now stale
+            loaded.ext_folders = None; // per-type ranking is now stale too
         }
         Err(e) => {
             log::error!("Failed to delete {:?}: {}", target.fs_path, e);
