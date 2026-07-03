@@ -6,6 +6,8 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 
 - **Treemap visualization** with cushion shading (matching WinDirStat's look)
 - **Directory tree** with collapsible nodes, keyboard navigation, and size annotations
+- **Tree and treemap stay in sync** — selecting a rectangle scrolls the tree to it, and navigating (double-click, breadcrumb, back/forward) expands the tree to match the treemap's current folder
+- **Approximate size indicator** — directory sizes are marked with "~" whenever the scan left content out (small-file threshold, excluded/cloud folders, unreadable directories), so you know when a total is a lower bound rather than exact
 - **File type breakdown** showing extension statistics with color coding
 - **Fast scanning** using macOS-native `getattrlistbulk` syscall with parallel tree building via rayon
 - **Delete files/folders** directly from the UI — ⌘Delete for instant delete, Delete for native macOS confirmation dialog
