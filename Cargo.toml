@@ -6,7 +6,7 @@ description = "fast windirstat clone for macos"
 license = "GPL-3.0"
 
 [dependencies]
-eframe = "0.31"
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"

@@ -1,0 +1,24 @@
+# Config for `cargo audit` (see https://docs.rs/cargo-audit).
+#
+# Both IDs below trace, via `cargo tree --target all -i quick-xml`, to
+# zbus_xml -> accesskit_atspi_common -> accesskit_unix -> accesskit_winit
+# -> egui-winit -> eframe: the Linux AT-SPI accessibility backend, which
+# egui/eframe's `accesskit` feature pulls in for every platform in
+# Cargo.lock even though it's `cfg(target_os = "linux")`-gated and never
+# compiled into the macOS binary this project ships (macOS accessibility
+# goes through `accesskit_macos` instead, a separate, unaffected crate).
+#
+# Re-verify with the same `cargo tree --target all -i <crate>` command
+# before adding anything new here — this file must never be used to hide
+# a finding that's actually reachable from the shipped binary.
+#
+# `cargo audit`'s "unmaintained" warnings (atomic-polyfill, paste,
+# ttf-parser) are intentionally NOT listed here: they already don't fail
+# the check by default, and ttf-parser in particular *is* part of the real
+# macOS build (font glyph parsing via ab_glyph), so it stays visible in
+# `cargo audit` output rather than being suppressed.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0195", # quick-xml memory-exhaustion DoS — Linux-only AT-SPI path
+    "RUSTSEC-2026-0194", # quick-xml quadratic-time parsing — Linux-only AT-SPI path
+]
