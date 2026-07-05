@@ -19,6 +19,8 @@ pub struct Settings {
     /// User-defined absolute folder paths to skip entirely during scans.
     /// Useful for slow/network/cloud trees the built-in toggle doesn't cover.
     pub custom_excludes: Vec<String>,
+    /// Show the floating info card (name/size/path) when an item is selected.
+    pub show_info_card: bool,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Default for Settings {
             min_file_size_mb: 25,
             scan_threads: 0,
             custom_excludes: Vec::new(),
+            show_info_card: true,
         }
     }
 }
@@ -54,12 +57,13 @@ impl Settings {
     /// written as repeated `exclude=<path>` lines.
     fn serialize(&self) -> String {
         let mut out = format!(
-            "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\nscan_threads={}\n",
+            "ignore_cloud_storage={}\nskip_duplicate_inodes={}\noptimization_mode={}\nmin_file_size_mb={}\nscan_threads={}\nshow_info_card={}\n",
             self.ignore_cloud_storage,
             self.skip_duplicate_inodes,
             self.optimization_mode,
             self.min_file_size_mb,
             self.scan_threads,
+            self.show_info_card,
         );
         for p in &self.custom_excludes {
             out.push_str("exclude=");
@@ -91,6 +95,8 @@ impl Settings {
                 if !p.is_empty() {
                     s.custom_excludes.push(p.to_string());
                 }
+            } else if let Some(val) = line.strip_prefix("show_info_card=") {
+                s.show_info_card = val.trim() == "true";
             }
         }
         s
@@ -143,6 +149,7 @@ mod tests {
             "/Users/me/Library/Caches".to_string(),
             "/Volumes/Backup".to_string(),
         ];
+        s.show_info_card = false;
         let parsed = Settings::parse(&s.serialize());
         assert_eq!(parsed, s);
     }

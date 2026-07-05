@@ -39,7 +39,7 @@ pub struct NodeRect {
 /// A node in the file tree. Compact by design — 72 bytes/struct.
 /// `Box<str>`/`Box<[T]>` (not String/Vec), an f32 `NodeRect`, and u32 counts
 /// keep per-node memory low: a full-disk scan can hold several million of these.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileNode {
     pub name: Box<str>,
     pub children: Box<[FileNode]>,
@@ -119,8 +119,16 @@ pub struct ExtDirSummary {
     pub ext_count: u64,
 }
 
+/// A single file, used by the "All Files" flat list view.
+#[derive(Clone)]
+pub struct FileSummary {
+    pub path: TreePath,
+    pub name: Box<str>,
+    pub size: u64,
+}
+
 /// The complete scanned file tree with precomputed extension statistics.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileTree {
     pub root: FileNode,
     pub root_path: String,
@@ -356,6 +364,18 @@ impl FileTree {
         dirs
     }
 
+    /// Flatten every individual file in the scan (no directories), largest
+    /// first. Powers the "All Files" view — unlike `largest_directories` this
+    /// is not truncated, since browsing every file flat (rather than drilling
+    /// through folders one at a time) is the point of that view.
+    pub fn all_files(&self) -> Vec<FileSummary> {
+        let mut files: Vec<FileSummary> = Vec::new();
+        let mut path: Vec<usize> = Vec::new();
+        collect_files(&self.root, &mut path, &mut files);
+        files.sort_unstable_by_key(|f| std::cmp::Reverse(f.size));
+        files
+    }
+
     /// Folders that contain files of `ext`, ranked by how many bytes of that
     /// extension live under each (descending). Pass the `(no ext)` sentinel to
     /// match extensionless files. Powers the "filter by file type" view.
@@ -442,6 +462,23 @@ fn collect_dirs(node: &FileNode, path: &mut Vec<usize>, out: &mut Vec<DirSummary
             collect_dirs(child, path, out);
             path.pop();
         }
+    }
+}
+
+/// Recursively collect every file (not directory) into `out`.
+fn collect_files(node: &FileNode, path: &mut Vec<usize>, out: &mut Vec<FileSummary>) {
+    for (i, child) in node.children.iter().enumerate() {
+        path.push(i);
+        if child.is_dir {
+            collect_files(child, path, out);
+        } else {
+            out.push(FileSummary {
+                path: path.clone(),
+                name: child.name.clone(),
+                size: child.size,
+            });
+        }
+        path.pop();
     }
 }
 

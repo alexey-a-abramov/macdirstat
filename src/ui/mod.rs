@@ -1,3 +1,4 @@
+pub mod files_view;
 pub mod largest_view;
 pub mod sunburst_view;
 pub mod tree_view;

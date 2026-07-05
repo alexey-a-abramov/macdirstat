@@ -39,6 +39,7 @@ enum ViewMode {
     Treemap,
     Sunburst,
     Largest,
+    AllFiles,
 }
 
 /// Left-sidebar tab.
@@ -56,6 +57,14 @@ enum ExtSort {
     Size,
 }
 
+// File Types table column geometry — shared between the header and body rows
+// so text lands in fixed, aligned columns instead of packing ragged per-row.
+const SWATCH_SIZE: f32 = 8.0;
+const SWATCH_GAP: f32 = 6.0;
+const COL_PCT_WIDTH: f32 = 46.0;
+const COL_SIZE_WIDTH: f32 = 64.0;
+const COL_COUNT_WIDTH: f32 = 56.0;
+
 struct LoadedState {
     tree: FileTree,
     color_map: ColorMap,
@@ -66,7 +75,6 @@ struct LoadedState {
     cached_view_root: TreePath,
     treemap_texture: Option<egui::TextureHandle>,
     pending_scan: Option<PathBuf>,
-    open_settings_requested: bool,
     /// True when the displayed tree came from a scan the user stopped early.
     partial: bool,
     /// Optimized rescan requested (check existing nodes only, no full re-walk).
@@ -85,6 +93,16 @@ struct LoadedState {
     ext_sort: ExtSort,
     ext_sort_asc: bool,
     file_types_search: String,
+    /// Cache of the File Types tab's filtered+sorted rows, keyed by
+    /// (search string, sort column, ascending). Recomputed only when the key
+    /// changes or the tree's extension stats change — not every repaint.
+    file_types_cache: Option<(String, ExtSort, bool, Vec<crate::model::tree::ExtStat>)>,
+    /// Cached flat "All Files" list (every file in the scan, largest first),
+    /// recomputed lazily after tree changes.
+    all_files: Option<Vec<crate::model::tree::FileSummary>>,
+    all_files_search: String,
+    /// Indices into `all_files` matching `all_files_search`, cached by search string.
+    all_files_filter_cache: Option<(String, Vec<usize>)>,
     /// (free, total, volume name) of the scanned volume, for the sidebar bar.
     volume: Option<(u64, u64, String)>,
     /// The navigated folder the right panel + breadcrumb reflect. Distinct from
@@ -96,6 +114,11 @@ struct LoadedState {
     history_pos: usize,
     /// True when this tree was loaded from the on-disk cache (not freshly scanned).
     from_cache: bool,
+    /// Set right after a cache load: a silent background optimized-refresh
+    /// (existence/size check only) in flight. Polled each frame without ever
+    /// leaving `AppState::Loaded`, so the cached tree stays fully browsable
+    /// while it updates in place.
+    background_refresh: Option<std::sync::mpsc::Receiver<FileTree>>,
 }
 
 /// Build a `Loaded` state from a finished/loaded tree (shared by scan completion
@@ -117,7 +140,6 @@ fn loaded_state(
         cached_view_root: Vec::new(),
         treemap_texture: None,
         pending_scan: None,
-        open_settings_requested: false,
         partial,
         pending_refresh: false,
         view_mode: ViewMode::Treemap,
@@ -128,11 +150,16 @@ fn loaded_state(
         ext_sort: ExtSort::Size,
         ext_sort_asc: false,
         file_types_search: String::new(),
+        file_types_cache: None,
+        all_files: None,
+        all_files_search: String::new(),
+        all_files_filter_cache: None,
         volume,
         current_dir: Vec::new(),
         history: vec![Vec::new()],
         history_pos: 0,
         from_cache,
+        background_refresh: None,
     })
 }
 
@@ -217,10 +244,14 @@ impl App {
             .map(PathBuf::from)
             .unwrap_or_else(default_scan_dir);
         // Render the previous scan instantly from cache if we have one; otherwise
-        // fall back to a fresh scan. Either way the user can Rescan to refresh.
+        // fall back to a fresh scan. When loading from cache, also kick off a
+        // silent optimized refresh in the background so sizes update in place
+        // without blocking browsing of the (possibly stale) cached view.
         let state = match path.to_str().and_then(crate::cache::load) {
             Some((tree, scan_time_ms)) => {
-                AppState::Loaded(loaded_state(tree, scan_time_ms, false, true))
+                let mut loaded = loaded_state(tree, scan_time_ms, false, true);
+                loaded.background_refresh = Some(spawn_background_refresh(&settings, &loaded.tree));
+                AppState::Loaded(loaded)
             }
             None => spawn_scan(&settings, path),
         };
@@ -342,6 +373,12 @@ impl App {
                     {
                         set_mode = Some(ViewMode::Largest);
                     }
+                    if ui
+                        .selectable_label(cur == ViewMode::AllFiles, "\u{1F4C4} All Files")
+                        .clicked()
+                    {
+                        set_mode = Some(ViewMode::AllFiles);
+                    }
                 }
             });
         });
@@ -422,6 +459,37 @@ impl eframe::App for App {
             self.state = AppState::Loaded(loaded_state(tree, scan_time_ms, partial, false));
         }
 
+        // Check whether a silent background refresh (started after a cache
+        // load) has finished. Never leaves AppState::Loaded, so the tree stays
+        // browsable throughout — only the swap below is user-visible.
+        if let AppState::Loaded(loaded) = &mut self.state {
+            let refreshed = loaded
+                .background_refresh
+                .as_ref()
+                .and_then(|rx| rx.try_recv().ok());
+            if let Some(tree) = refreshed {
+                log::info!(
+                    "Background refresh complete: {} — {} files, {} dirs, {}",
+                    tree.root_path,
+                    tree.root.file_count,
+                    tree.root.dir_count,
+                    format_size(tree.root.size),
+                );
+                loaded.tree = tree;
+                loaded.color_map = ColorMap::from_extensions(&loaded.tree.extensions);
+                loaded.cached_layout_rect = None;
+                loaded.cached_view_root.clear();
+                loaded.treemap_texture = None;
+                loaded.largest = None;
+                loaded.ext_folders = None;
+                loaded.file_types_cache = None;
+                loaded.all_files = None;
+                loaded.all_files_filter_cache = None;
+                loaded.from_cache = false;
+                loaded.background_refresh = None;
+            }
+        }
+
         match &mut self.state {
             AppState::Scanning {
                 path,
@@ -430,24 +498,23 @@ impl eframe::App for App {
                 ..
             } => {
                 let count = progress.load(Ordering::Relaxed);
-                show_scanning_panes(ctx, path, count, cancel, &mut self.settings_open);
+                show_scanning_panes(ctx, path, count, cancel);
                 ctx.request_repaint();
             }
             AppState::Loaded(loaded) => {
                 handle_delete(loaded, ctx);
-                loaded.as_mut().show_panels(ctx);
+                loaded.as_mut().show_panels(ctx, self.settings.show_info_card);
+                if loaded.background_refresh.is_some() {
+                    ctx.request_repaint();
+                }
             }
         }
 
-        // Handle ⌘O, ⌘R, pending scans/refreshes, and settings_open flag — outside
-        // the match to avoid borrow conflicts with self.state.
+        // Handle ⌘O, ⌘R, and pending scans/refreshes — outside the match to
+        // avoid borrow conflicts with self.state.
         if let AppState::Loaded(loaded) = &mut self.state {
             let cmd_o = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
             let cmd_r = ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.command);
-            if loaded.open_settings_requested {
-                loaded.open_settings_requested = false;
-                self.settings_open = true;
-            }
             // ⌘R and the status-bar Rescan button both trigger optimized refresh.
             // ⌘O and breadcrumb/pending_scan trigger a full scan (new root or new settings).
             let do_refresh = cmd_r || std::mem::take(&mut loaded.pending_refresh);
@@ -592,6 +659,24 @@ impl eframe::App for App {
                                 .color(egui::Color32::GRAY),
                             );
                         });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Display").strong());
+                    ui.add_space(2.0);
+                    ui.checkbox(
+                        &mut self.settings.show_info_card,
+                        "Show info card for selected item",
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "A small floating card with name, size, and full path\nwhenever a file or folder is selected.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+
                     ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -617,15 +702,18 @@ impl eframe::App for App {
 }
 
 impl LoadedState {
-    fn show_panels(&mut self, ctx: &egui::Context) {
+    fn show_panels(&mut self, ctx: &egui::Context, show_info_card: bool) {
         self.show_file_types_bar(ctx);
         self.show_status_bar(ctx);
         self.show_tree_panel(ctx);
         self.show_central_panel(ctx);
-        self.show_info_card(ctx);
+        if show_info_card {
+            self.show_info_card(ctx);
+        }
     }
 
     /// Floating info card for the selected item (single-click selects → shows this).
+    /// Toggleable via Settings — off by default it's a small distraction over the treemap.
     fn show_info_card(&self, ctx: &egui::Context) {
         let Some(sel) = self.selected.as_ref() else {
             return;
@@ -698,7 +786,16 @@ impl LoadedState {
                         "Scan was stopped early — sizes are incomplete. Rescan for full results.",
                     );
                 }
-                if self.from_cache {
+                if self.background_refresh.is_some() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("\u{27F3} Refreshing\u{2026}")
+                            .color(egui::Color32::from_rgb(120, 170, 240)),
+                    )
+                    .on_hover_text(
+                        "Checking the cached scan against disk in the background\u{2014}sizes will update in place.",
+                    );
+                } else if self.from_cache {
                     ui.separator();
                     ui.label(
                         egui::RichText::new("\u{1F4E6} Cached")
@@ -750,14 +847,6 @@ impl LoadedState {
                         .clicked()
                     {
                         self.pending_refresh = true;
-                    }
-
-                    if ui
-                        .button("\u{2699}\u{FE0F}")
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.open_settings_requested = true;
                     }
                 });
             });
@@ -830,80 +919,128 @@ impl LoadedState {
         );
         ui.add_space(4.0);
 
-        // Sortable header row.
+        // Sortable header row. Column widths mirror the body row below so
+        // header labels land directly above their column, not ragged per-row.
         let mut clicked: Option<ExtSort> = None;
+        let arrow_for = |col: ExtSort| -> &'static str {
+            if self.ext_sort != col {
+                ""
+            } else if self.ext_sort_asc {
+                " \u{25B2}"
+            } else {
+                " \u{25BC}"
+            }
+        };
         ui.horizontal(|ui| {
-            let mut header = |ui: &mut egui::Ui, label: &str, col: ExtSort| {
-                let arrow = if self.ext_sort == col {
-                    if self.ext_sort_asc {
-                        " \u{25B2}"
-                    } else {
-                        " \u{25BC}"
-                    }
-                } else {
-                    ""
-                };
-                if ui
-                    .selectable_label(self.ext_sort == col, format!("{label}{arrow}"))
-                    .clicked()
-                {
-                    clicked = Some(col);
+            // Offset to match the swatch + gap that precedes the name in body rows.
+            ui.add_space(SWATCH_SIZE + SWATCH_GAP);
+            let label = format!("Type{}", arrow_for(ExtSort::Name));
+            if ui
+                .selectable_label(self.ext_sort == ExtSort::Name, label)
+                .clicked()
+            {
+                clicked = Some(ExtSort::Name);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Blank spacer matching the percent column, which has no header.
+                ui.add_space(COL_PCT_WIDTH);
+                let label = format!("Size{}", arrow_for(ExtSort::Size));
+                let widget = egui::SelectableLabel::new(self.ext_sort == ExtSort::Size, label);
+                if ui.add_sized(egui::vec2(COL_SIZE_WIDTH, 18.0), widget).clicked() {
+                    clicked = Some(ExtSort::Size);
                 }
-            };
-            header(ui, "Type", ExtSort::Name);
-            header(ui, "Files", ExtSort::Count);
-            header(ui, "Size", ExtSort::Size);
+                let label = format!("Files{}", arrow_for(ExtSort::Count));
+                let widget = egui::SelectableLabel::new(self.ext_sort == ExtSort::Count, label);
+                if ui.add_sized(egui::vec2(COL_COUNT_WIDTH, 18.0), widget).clicked() {
+                    clicked = Some(ExtSort::Count);
+                }
+            });
         });
         if let Some(col) = clicked {
             self.toggle_ext_sort(col);
         }
         ui.separator();
 
-        // Filter + sort.
+        // Filter + sort — cached by (search, sort col, direction) so this only
+        // recomputes when one of those actually changes, not on every repaint
+        // (a keystroke, a hover, a window resize all repaint the panel).
         let q = self.file_types_search.trim().to_lowercase();
-        let mut rows: Vec<&crate::model::tree::ExtStat> = self
-            .tree
-            .extensions
-            .iter()
-            .filter(|s| q.is_empty() || s.ext.to_lowercase().contains(&q))
-            .collect();
-        match self.ext_sort {
-            ExtSort::Name => rows.sort_by(|a, b| a.ext.cmp(&b.ext)),
-            ExtSort::Count => rows.sort_by_key(|s| s.count),
-            ExtSort::Size => rows.sort_by_key(|s| s.bytes),
+        let cache_hit = self
+            .file_types_cache
+            .as_ref()
+            .is_some_and(|(cq, cs, ca, _)| *cq == q && *cs == self.ext_sort && *ca == self.ext_sort_asc);
+        if !cache_hit {
+            let mut rows: Vec<crate::model::tree::ExtStat> = self
+                .tree
+                .extensions
+                .iter()
+                .filter(|s| q.is_empty() || s.ext.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+            match self.ext_sort {
+                ExtSort::Name => rows.sort_by(|a, b| a.ext.cmp(&b.ext)),
+                ExtSort::Count => rows.sort_by_key(|s| s.count),
+                ExtSort::Size => rows.sort_by_key(|s| s.bytes),
+            }
+            if !self.ext_sort_asc {
+                rows.reverse();
+            }
+            self.file_types_cache = Some((q, self.ext_sort, self.ext_sort_asc, rows));
         }
-        if !self.ext_sort_asc {
-            rows.reverse();
-        }
+        let rows = &self.file_types_cache.as_ref().unwrap().3;
 
         let mut clicked_ext: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                for stat in &rows {
+                for stat in rows {
                     let pct = stat.bytes as f64 / total as f64 * 100.0;
                     let is_filter = self.filter_ext.as_deref() == Some(&*stat.ext);
                     let row = ui.horizontal(|ui| {
+                        // Swatch: a crisp rounded square, not a sub-pixel-centered dot —
+                        // small circles at this size anti-alias into a fuzzy smudge.
                         let color = self.color_map.get(&stat.ext);
-                        let (dot, _) =
-                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 3.5, color);
+                        let (swatch_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(SWATCH_SIZE, SWATCH_SIZE),
+                            egui::Sense::hover(),
+                        );
+                        let rounded = egui::Rect::from_min_size(
+                            swatch_rect.min.round(),
+                            swatch_rect.size().round(),
+                        );
+                        ui.painter().rect_filled(rounded, 2.0, color);
+                        ui.add_space(SWATCH_GAP);
+
                         let mut name = egui::RichText::new(&*stat.ext).size(12.0);
                         if is_filter {
                             name = name.strong().color(egui::Color32::from_rgb(56, 132, 244));
                         }
                         ui.label(name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{pct:.1}%"))
-                                    .size(11.0)
-                                    .color(egui::Color32::GRAY),
+                            ui.add_sized(
+                                egui::vec2(COL_PCT_WIDTH, 16.0),
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{pct:.1}%"))
+                                        .size(11.0)
+                                        .color(egui::Color32::GRAY),
+                                )
+                                .halign(egui::Align::RIGHT),
                             );
-                            ui.label(egui::RichText::new(format_size(stat.bytes)).size(11.0));
-                            ui.label(
-                                egui::RichText::new(format_file_count(stat.count))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_gray(150)),
+                            ui.add_sized(
+                                egui::vec2(COL_SIZE_WIDTH, 16.0),
+                                egui::Label::new(
+                                    egui::RichText::new(format_size(stat.bytes)).size(11.0),
+                                )
+                                .halign(egui::Align::RIGHT),
+                            );
+                            ui.add_sized(
+                                egui::vec2(COL_COUNT_WIDTH, 16.0),
+                                egui::Label::new(
+                                    egui::RichText::new(format_file_count(stat.count))
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(150)),
+                                )
+                                .halign(egui::Align::RIGHT),
                             );
                         });
                     });
@@ -954,9 +1091,10 @@ impl LoadedState {
         // The right panel roots at the navigated folder, not the selection.
         let view_root = self.current_dir.clone();
 
+        let mut banner_rescan = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tree.permission_denied > 0 {
-                show_permission_banner(ui, self.tree.permission_denied);
+                banner_rescan = show_permission_banner(ui, self.tree.permission_denied);
             }
             self.show_breadcrumb(ui, &mut nav);
             ui.add_space(4.0);
@@ -1020,6 +1158,22 @@ impl LoadedState {
                             );
                         }
                     }
+                    ViewMode::AllFiles => {
+                        if self.all_files.is_none() {
+                            self.all_files = Some(self.tree.all_files());
+                        }
+                        if let Some(files) = self.all_files.as_ref() {
+                            ui::files_view::show(
+                                ui,
+                                &self.tree,
+                                files,
+                                &mut self.all_files_search,
+                                &mut self.all_files_filter_cache,
+                                &mut self.selected,
+                                &mut activated,
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -1032,6 +1186,9 @@ impl LoadedState {
         }
         if let Some(n) = nav {
             self.apply_nav(n);
+        }
+        if banner_rescan {
+            self.pending_refresh = true;
         }
         handle_context_action(self, ctx, finder_action);
     }
@@ -1277,6 +1434,9 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
             loaded.treemap_texture = None;
             loaded.largest = None; // ranking is now stale
             loaded.ext_folders = None; // per-type ranking is now stale too
+            loaded.file_types_cache = None; // extension stats changed too
+            loaded.all_files = None; // flat file list is now stale too
+            loaded.all_files_filter_cache = None;
         }
         Err(e) => {
             log::error!("Failed to delete {:?}: {}", target.fs_path, e);
@@ -1292,7 +1452,6 @@ fn show_scanning_panes(
     path: &std::path::Path,
     file_count: u64,
     cancel: &AtomicBool,
-    settings_open: &mut bool,
 ) {
     let stopping = cancel.load(Ordering::Relaxed);
 
@@ -1303,14 +1462,6 @@ fn show_scanning_panes(
                 format_file_count(file_count)
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("\u{2699}\u{FE0F}")
-                    .on_hover_text("Settings")
-                    .clicked()
-                {
-                    *settings_open = true;
-                }
-                ui.separator();
                 if compact_stop_button(ui, stopping).clicked() {
                     request_stop(cancel);
                 }
@@ -1503,7 +1654,7 @@ fn handle_finder_action(action: ui::ContextAction, path: &std::path::Path, is_di
     }
 }
 
-fn format_file_count(count: u64) -> String {
+pub(crate) fn format_file_count(count: u64) -> String {
     if count >= 1_000_000 {
         format!("{:.1}M", count as f64 / 1_000_000.0)
     } else if count >= 1_000 {
@@ -1629,6 +1780,30 @@ fn spawn_refresh(settings: &Settings, tree: FileTree) -> AppState {
     }
 }
 
+/// Spawn a silent background optimized refresh of a clone of `tree`, returning
+/// a receiver that yields the refreshed tree when done. Unlike `spawn_refresh`,
+/// this never touches `AppState` — the caller keeps browsing the original tree
+/// (still in `LoadedState.tree`) while this works on an independent copy in
+/// the background, then the caller swaps it in once it arrives.
+fn spawn_background_refresh(settings: &Settings, tree: &FileTree) -> std::sync::mpsc::Receiver<FileTree> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = Arc::new(AtomicU64::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tree = tree.clone();
+    let excluded = settings.excluded_paths();
+    let path = tree.root_path.clone();
+
+    log::info!("Background refresh started: {}", path);
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        let refreshed = tree.refresh_exists(&excluded, &progress, &cancel);
+        crate::cache::save(&refreshed, t.elapsed().as_secs_f64() * 1000.0);
+        let _ = tx.send(refreshed);
+    });
+
+    rx
+}
+
 /// Spawn a background scan of `path` and return the `Scanning` state that tracks it.
 fn spawn_scan(settings: &Settings, path: PathBuf) -> AppState {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1750,7 +1925,9 @@ fn show_volume_bar(ui: &mut egui::Ui, volume: &Option<(u64, u64, String)>) {
 }
 
 /// A banner shown when the scan hit unreadable directories (missing Full Disk Access).
-fn show_permission_banner(ui: &mut egui::Ui, denied: u64) {
+/// Returns `true` if the user clicked "Rescan" on the banner.
+fn show_permission_banner(ui: &mut egui::Ui, denied: u64) -> bool {
+    let mut rescan_clicked = false;
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(64, 52, 22))
         .inner_margin(8.0)
@@ -1759,7 +1936,8 @@ fn show_permission_banner(ui: &mut egui::Ui, denied: u64) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "\u{26A0} {} folders couldn't be read — totals are incomplete.",
+                        "\u{26A0} {} folders couldn't be read — totals are incomplete. If you've \
+                         already granted access below, click Rescan to pick it up.",
                         format_file_count(denied)
                     ))
                     .color(egui::Color32::from_rgb(240, 205, 130)),
@@ -1767,9 +1945,13 @@ fn show_permission_banner(ui: &mut egui::Ui, denied: u64) {
                 if ui.button("Grant Full Disk Access\u{2026}").clicked() {
                     open_full_disk_access_settings();
                 }
+                if ui.button("\u{21BA} Rescan").clicked() {
+                    rescan_clicked = true;
+                }
             });
         });
     ui.add_space(4.0);
+    rescan_clicked
 }
 
 /// Open System Settings at Privacy & Security → Full Disk Access.
