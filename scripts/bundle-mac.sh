@@ -2,13 +2,19 @@
 #
 # Build an installable MacDirStat.app bundle from the release binary.
 #
-#   ./scripts/bundle-mac.sh
+#   ./scripts/bundle-mac.sh            # build only, drag the .app in yourself
+#   ./scripts/bundle-mac.sh --install  # build AND copy it into /Applications, then launch it
 #
-# Produces target/release/bundle/MacDirStat.app — drag it into /Applications.
+# Produces target/release/bundle/MacDirStat.app.
 # Requires the standard macOS tools: sips, iconutil, codesign (all built in).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+INSTALL=0
+if [[ "${1:-}" == "--install" ]]; then
+    INSTALL=1
+fi
 
 APP_NAME="MacDirStat"
 BIN_NAME="macdirstat"
@@ -72,6 +78,16 @@ codesign --force --sign - "${APP}"
 
 echo ""
 echo "Built ${APP}"
-echo "Install with:  cp -R \"${APP}\" /Applications/"
-echo "First launch:  right-click → Open (ad-hoc signed, so Gatekeeper asks once)."
+
+if [[ "${INSTALL}" -eq 1 ]]; then
+    echo "==> Installing to /Applications/${APP_NAME}.app…"
+    rm -rf "/Applications/${APP_NAME}.app"
+    cp -R "${APP}" /Applications/
+    echo "==> Launching…"
+    open "/Applications/${APP_NAME}.app"
+    echo "First launch: if Gatekeeper blocks it, right-click the app in /Applications → Open (ad-hoc signed)."
+else
+    echo "Install with:  cp -R \"${APP}\" /Applications/"
+    echo "First launch:  right-click → Open (ad-hoc signed, so Gatekeeper asks once)."
+fi
 echo "Protected folders: System Settings → Privacy & Security → Full Disk Access → add ${APP_NAME}."

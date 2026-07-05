@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build .app bundle
+        run: ./scripts/bundle-mac.sh
+
+      - name: Zip the app bundle
+        run: |
+          cd target/release/bundle
+          zip -r -y "MacDirStat-${{ github.ref_name }}-macos.zip" MacDirStat.app
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.zip
+          generate_release_notes: true
