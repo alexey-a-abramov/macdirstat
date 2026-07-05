@@ -62,6 +62,10 @@ pub fn show(
     if selection_changed {
         if let Some(sel_path) = selected.as_ref() {
             expand_to_path(ui.ctx(), sel_path);
+            // Close every other expanded branch not on the way to the new
+            // selection, so the revealed item isn't buried under whatever the
+            // user previously browsed elsewhere in the tree.
+            collapse_other_branches(ui.ctx(), root, &mut Vec::new(), sel_path, 0);
         }
         ui.ctx()
             .data_mut(|d| d.insert_temp(last_expanded_id, selected.clone()));
@@ -81,13 +85,34 @@ pub fn show(
 
     // Scroll the changed item into view. A selection change is the more specific
     // intent (single-click reveal), so it wins; otherwise follow navigation.
-    let scroll_target: Option<TreePath> = if selection_changed {
-        selected.clone()
+    //
+    // A freshly-expanded ancestor animates open over several frames (egui
+    // tweens the collapsing-header height), so the target row's on-screen
+    // position keeps shifting after we expand it. Scrolling only on the one
+    // frame the expansion starts lands on a still-animating — and therefore
+    // wrong — position, which is why the revealed row could end up off-screen.
+    // Keep re-issuing the scroll for a few frames so it tracks the settling
+    // layout instead of firing once too early.
+    let scroll_state_id = Id::new("tree_scroll_state");
+    let (stored_target, stored_frames): (Option<TreePath>, u8) = ui
+        .ctx()
+        .data_mut(|d| d.get_temp(scroll_state_id))
+        .unwrap_or((None, 0));
+    const SCROLL_SETTLE_FRAMES: u8 = 10;
+    let (scroll_target, scroll_frames) = if selection_changed && selected.is_some() {
+        (selected.clone(), SCROLL_SETTLE_FRAMES)
     } else if nav_changed {
-        Some(current_dir.to_vec())
+        (Some(current_dir.to_vec()), SCROLL_SETTLE_FRAMES)
+    } else if stored_frames > 0 {
+        (stored_target, stored_frames - 1)
     } else {
-        None
+        (None, 0)
     };
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(scroll_state_id, (scroll_target.clone(), scroll_frames)));
+    if scroll_frames > 0 {
+        ui.ctx().request_repaint();
+    }
 
     // Rounded-corner container for the tree (Finder/System Settings style)
     let frame_fill = if ui.visuals().dark_mode {
@@ -198,6 +223,45 @@ fn expand_including_path(ctx: &egui::Context, path: &[usize]) {
             egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, false);
         state.set_open(true);
         state.store(ctx);
+    }
+}
+
+/// Close every expanded directory that isn't on the ancestor path to
+/// `keep_path`, so a freshly revealed selection doesn't end up buried under
+/// whatever else the user previously expanded elsewhere in the tree. Only
+/// recurses into branches that are either on the path or the root — an
+/// already-collapsed sibling is left untouched (nothing to close), and a
+/// non-ancestor branch is closed without descending further into it, so this
+/// stays cheap even on a very large tree.
+fn collapse_other_branches(
+    ctx: &egui::Context,
+    node: &FileNode,
+    path: &mut Vec<usize>,
+    keep_path: &[usize],
+    depth: usize,
+) {
+    if !node.is_dir || node.children.is_empty() {
+        return;
+    }
+    // Leave the selected node's own open/closed state exactly as the user left it.
+    if path.as_slice() == keep_path {
+        return;
+    }
+    let is_ancestor = path.len() < keep_path.len() && keep_path[..path.len()] == path[..];
+    if depth > 0 && !is_ancestor {
+        let id = Id::new(("tree", path.as_slice()));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, false);
+        if state.is_open() {
+            state.set_open(false);
+            state.store(ctx);
+        }
+        return;
+    }
+    for (i, child) in node.children.iter().enumerate() {
+        path.push(i);
+        collapse_other_branches(ctx, child, path, keep_path, depth + 1);
+        path.pop();
     }
 }
 
