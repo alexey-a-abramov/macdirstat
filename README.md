@@ -29,7 +29,25 @@ Grab the prebuilt app from the [latest release](https://github.com/alexey-a-abra
 - **`MacDirStat-<version>-macos.dmg`** — open it and drag `MacDirStat` onto the `Applications` shortcut.
 - **`MacDirStat-<version>-macos.zip`** — unzip and move `MacDirStat.app` into `/Applications` yourself.
 
-Both contain the same app (Apple Silicon). It's ad-hoc code-signed (not notarized), so on first launch right-click the app → **Open** once to let Gatekeeper through. To let it scan protected locations, add it under **System Settings → Privacy & Security → Full Disk Access**.
+Both contain the same app (Apple Silicon).
+
+### First launch
+
+The app is ad-hoc code-signed but **not notarized**, so Gatekeeper blocks it the
+first time. Open it once, let macOS refuse, then go to **System Settings →
+Privacy & Security**, scroll to the Security section, and click **Open Anyway**.
+
+> On macOS 15 (Sequoia) and later this is the only way — Apple removed the old
+> "right-click → Open" bypass for apps that aren't notarized.
+
+Or clear the download quarantine from the terminal instead:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/MacDirStat.app
+```
+
+To let it scan protected locations, add it under **System Settings → Privacy &
+Security → Full Disk Access**.
 
 ## Building
 

@@ -85,9 +85,11 @@ if [[ "${INSTALL}" -eq 1 ]]; then
     cp -R "${APP}" /Applications/
     echo "==> Launching…"
     open "/Applications/${APP_NAME}.app"
-    echo "First launch: if Gatekeeper blocks it, right-click the app in /Applications → Open (ad-hoc signed)."
+    echo "First launch: if macOS blocks it (ad-hoc signed, not notarized), allow it via"
+    echo "  System Settings → Privacy & Security → Open Anyway."
 else
     echo "Install with:  cp -R \"${APP}\" /Applications/"
-    echo "First launch:  right-click → Open (ad-hoc signed, so Gatekeeper asks once)."
+    echo "First launch:  ad-hoc signed, not notarized — allow it via"
+    echo "               System Settings → Privacy & Security → Open Anyway."
 fi
 echo "Protected folders: System Settings → Privacy & Security → Full Disk Access → add ${APP_NAME}."
