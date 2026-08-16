@@ -1,0 +1,27 @@
+name: Security audit
+
+# Split out of ci.yml so it reports its own status: the README badge pointed at
+# ci.yml, which meant it showed the build result under a "security audit" label.
+on:
+  push:
+    branches: [main]
+  # New advisories are published independently of our commits — RUSTSEC-2026-0257
+  # (webbrowser) landed 18 days after the last push and would never have been
+  # caught by a push-only trigger. Re-check weekly against an unchanged tree.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    # GitHub-hosted, deliberately: this is a public repo, and a self-hosted
+    # runner would execute fork-authored workflow code on a personal machine.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

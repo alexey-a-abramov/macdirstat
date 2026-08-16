@@ -1,7 +1,7 @@
 # MacDirStat
 
 [![CI](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml/badge.svg)](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml)
-[![Security audit](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml/badge.svg?event=push&label=security%20audit)](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml)
+[![Security audit](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/audit.yml/badge.svg)](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/audit.yml)
 [![Latest release](https://img.shields.io/github/v/release/alexey-a-abramov/macdirstat)](https://github.com/alexey-a-abramov/macdirstat/releases/latest)
 
 A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.net/) and [WizTree](https://diskanalyzer.com/) — the tools that were never quite matched by the alternatives on macOS.
