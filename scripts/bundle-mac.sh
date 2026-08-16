@@ -35,8 +35,13 @@ mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 # Keep symbols so the panic hook's backtraces stay useful — don't strip.
 cp "target/release/${BIN_NAME}" "${CONTENTS}/MacOS/${BIN_NAME}"
 
+# GPL-3.0 §4: convey the license along with the binary.
+cp LICENSE "${CONTENTS}/Resources/LICENSE"
+
 echo "==> Generating icon from ${ICON_SRC}…"
-ICONSET="$(mktemp -d)/${APP_NAME}.iconset"
+ICONSET_TMP="$(mktemp -d)"
+trap 'rm -rf "${ICONSET_TMP}"' EXIT
+ICONSET="${ICONSET_TMP}/${APP_NAME}.iconset"
 mkdir -p "${ICONSET}"
 gen() { sips -z "$1" "$1" "${ICON_SRC}" --out "${ICONSET}/$2" >/dev/null; }
 gen 16   icon_16x16.png

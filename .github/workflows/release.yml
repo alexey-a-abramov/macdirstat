@@ -15,23 +15,64 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build .app bundle
-        run: ./scripts/bundle-mac.sh
+      # The tag names the assets while Cargo.toml drives the version reported
+      # inside the app — catch them disagreeing before anything is published.
+      - name: Check the tag matches Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          crate="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$TAG" != "$crate" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $crate"
+            exit 1
+          fi
 
-      - name: Zip the app bundle
+      # A tag can point anywhere; don't ship a build that fails its own tests.
+      - name: Test
+        run: cargo test --release
+
+      # Builds MacDirStat.app via bundle-mac.sh, then the disk image from it.
+      - name: Build the .app and .dmg
+        id: build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ./scripts/make-dmg.sh "$TAG"
+          echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+      # Zip the exact bundle that went into the image, so both assets carry the
+      # same build with the same ad-hoc signature.
+      #
+      # Deliberately `zip -y`, not `ditto -c -k`: a ditto archive verifies only
+      # when unpacked with ditto/Archive Utility — extracting it with plain
+      # unzip(1) leaves the bundle failing codesign ("a sealed resource is
+      # missing or invalid"). `zip -y` round-trips cleanly through both.
+      - name: Zip the same app bundle
+        env:
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ steps.build.outputs.arch }}
         run: |
           cd target/release/bundle
-          zip -r -y "MacDirStat-${{ github.ref_name }}-macos.zip" MacDirStat.app
+          zip -qr -y "MacDirStat-${TAG}-macos-${ARCH}.zip" MacDirStat.app
 
-      # Rebuilds the .app itself (a no-op cargo build here) so the script stays
-      # correct when run standalone; the DMG can never ship a stale bundle.
-      - name: Build the .dmg
-        run: ./scripts/make-dmg.sh "${{ github.ref_name }}"
+      # The app isn't notarized, so users are told to bypass Gatekeeper — give
+      # them a way to check they got what we published.
+      - name: Checksums
+        env:
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ steps.build.outputs.arch }}
+        run: |
+          cd target/release/bundle
+          shasum -a 256 "MacDirStat-${TAG}-macos-${ARCH}.dmg" \
+                        "MacDirStat-${TAG}-macos-${ARCH}.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.dmg
-            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.zip
+            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos-${{ steps.build.outputs.arch }}.dmg
+            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos-${{ steps.build.outputs.arch }}.zip
+            target/release/bundle/SHA256SUMS.txt
+          fail_on_unmatched_files: true
           generate_release_notes: true

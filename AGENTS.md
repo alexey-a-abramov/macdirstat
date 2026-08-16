@@ -1,6 +1,6 @@
 # macdirstat
 
-macdirstat is a **macOS-only** disk-usage visualizer — a native WinDirStat/WizTree clone written in **Rust (2024 edition)**, built on **egui/eframe**. It scans disks fast by going below the standard filesystem APIs to the native `getattrlistbulk(2)` syscall (parallelized with rayon), then renders the results as a collapsible directory tree, an extension/type breakdown, and a squarified, cushion-shaded treemap. **License: GPL-3.0. Version: 0.5.0.**
+macdirstat is a **macOS-only** disk-usage visualizer — a native WinDirStat/WizTree clone written in **Rust (2024 edition)**, built on **egui/eframe**. It scans disks fast by going below the standard filesystem APIs to the native `getattrlistbulk(2)` syscall (parallelized with rayon), then renders the results as a collapsible directory tree, an extension/type breakdown, and a squarified, cushion-shaded treemap. **License: GPL-3.0. Version: 0.5.1.**
 
 It is macOS/Darwin-only by design: the scanner depends on `getattrlistbulk`, `openat`, and APFS/SSD assumptions, and will not compile or link off macOS.
 

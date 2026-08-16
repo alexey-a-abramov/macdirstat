@@ -26,10 +26,11 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 
 Grab the prebuilt app from the [latest release](https://github.com/alexey-a-abramov/macdirstat/releases/latest):
 
-- **`MacDirStat-<version>-macos.dmg`** — open it and drag `MacDirStat` onto the `Applications` shortcut.
-- **`MacDirStat-<version>-macos.zip`** — unzip and move `MacDirStat.app` into `/Applications` yourself.
+- **`MacDirStat-<version>-macos-arm64.dmg`** — open it and drag `MacDirStat` onto the `Applications` shortcut.
+- **`MacDirStat-<version>-macos-arm64.zip`** — unzip and move `MacDirStat.app` into `/Applications` yourself.
 
-Both contain the same app (Apple Silicon).
+Both contain the identical app bundle. **Apple Silicon only** — on an Intel Mac,
+build from source instead (see [Building](#building)).
 
 ### First launch
 
@@ -47,7 +48,9 @@ xattr -dr com.apple.quarantine /Applications/MacDirStat.app
 ```
 
 To let it scan protected locations, add it under **System Settings → Privacy &
-Security → Full Disk Access**.
+Security → Full Disk Access**. Because the app is ad-hoc signed, its signature
+changes with every build — macOS ties the grant to that signature, so you'll
+need to re-grant Full Disk Access after each update.
 
 ## Building
 
@@ -77,8 +80,9 @@ without touching `/Applications`.
 ./scripts/make-dmg.sh
 ```
 
-Produces `target/release/bundle/MacDirStat-v<version>-macos.dmg` — the app next to
-an `Applications` symlink, so opening it gives the usual drag-to-install window.
+Produces `target/release/bundle/MacDirStat-v<version>-macos-<arch>.dmg` — a plain
+Finder window holding the app next to an `Applications` symlink, so you install
+it by dragging one onto the other. (No custom background art or icon layout.)
 This is what the release workflow attaches to each tagged release.
 
 ## Usage

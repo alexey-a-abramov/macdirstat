@@ -18,20 +18,25 @@ APP_NAME="MacDirStat"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 # Release workflow passes the git tag (e.g. v0.5.1) so the asset name matches it.
 LABEL="${1:-v${VERSION}}"
+# cargo builds for the host only, so name the image after the arch it actually
+# runs on — an arm64 build under a neutral name strands Intel users.
+ARCH="$(uname -m)"
 
 APP="target/release/bundle/${APP_NAME}.app"
-DMG="target/release/bundle/${APP_NAME}-${LABEL}-macos.dmg"
+DMG="target/release/bundle/${APP_NAME}-${LABEL}-macos-${ARCH}.dmg"
 
 # Always rebuild the .app rather than reusing whatever is on disk: a stale bundle
 # from an earlier version would otherwise be shipped inside a correctly-named DMG.
 # `cargo build --release` is a no-op when nothing changed, so this stays cheap
 # even though the release workflow has already run bundle-mac.sh.
 echo "==> Building ${APP_NAME}.app…"
-./scripts/bundle-mac.sh >/dev/null
+./scripts/bundle-mac.sh
 
 echo "==> Staging disk image contents…"
 STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
+# mktemp -d gives 0700; the image's volume root would inherit it.
+chmod 755 "${STAGING}"
 # -R preserves the bundle's symlinks and the ad-hoc signature.
 cp -R "${APP}" "${STAGING}/"
 ln -s /Applications "${STAGING}/Applications"
@@ -51,7 +56,7 @@ echo "==> Verifying…"
 hdiutil verify -quiet "${DMG}"
 
 echo ""
-echo "Built ${DMG} ($(du -h "${DMG}" | cut -f1))"
+echo "Built ${DMG} ($(du -h "${DMG}" | cut -f1 | tr -d " "))"
 echo "Open it and drag ${APP_NAME} onto Applications."
 echo "First launch: ad-hoc signed, not notarized — macOS blocks it once. Allow it via"
 echo "  System Settings → Privacy & Security → Open Anyway, or clear the quarantine:"
