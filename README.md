@@ -29,8 +29,10 @@ Grab the prebuilt app from the [latest release](https://github.com/alexey-a-abra
 - **`MacDirStat-<version>-macos-arm64.dmg`** — open it and drag `MacDirStat` onto the `Applications` shortcut.
 - **`MacDirStat-<version>-macos-arm64.zip`** — unzip and move `MacDirStat.app` into `/Applications` yourself.
 
-Both contain the identical app bundle. **Apple Silicon only** — on an Intel Mac,
-build from source instead (see [Building](#building)).
+Both contain the identical app bundle. Requires **macOS 11 or later**, **Apple
+Silicon only** — on an Intel Mac, build from source instead (see
+[Building](#building)). `SHA256SUMS.txt` is attached if you want to verify the
+download.
 
 ### First launch
 

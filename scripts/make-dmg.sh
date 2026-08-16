@@ -2,8 +2,8 @@
 #
 # Build a distributable MacDirStat disk image from the .app bundle.
 #
-#   ./scripts/make-dmg.sh           # -> target/release/bundle/MacDirStat-v<version>-macos.dmg
-#   ./scripts/make-dmg.sh v0.5.1    # -> target/release/bundle/MacDirStat-v0.5.1-macos.dmg
+#   ./scripts/make-dmg.sh           # -> …/MacDirStat-v<version>-macos-<arch>.dmg
+#   ./scripts/make-dmg.sh v0.5.1    # -> …/MacDirStat-v0.5.1-macos-<arch>.dmg
 #
 # The image contains MacDirStat.app next to a symlink to /Applications, so
 # opening it gives the familiar drag-to-install window.
@@ -44,7 +44,7 @@ ln -s /Applications "${STAGING}/Applications"
 echo "==> Creating ${DMG}…"
 rm -f "${DMG}"
 hdiutil create \
-    -volname "${APP_NAME}" \
+    -volname "${APP_NAME} ${LABEL}" \
     -srcfolder "${STAGING}" \
     -fs HFS+ \
     -format UDZO \
