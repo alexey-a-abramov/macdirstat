@@ -24,7 +24,12 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 
 ## Download
 
-Grab the prebuilt app from the [latest release](https://github.com/alexey-a-abramov/macdirstat/releases/latest) — download the zip, unzip it, and drag `MacDirStat.app` into `/Applications`. It's ad-hoc code-signed (not notarized), so on first launch right-click the app → **Open** once to let Gatekeeper through.
+Grab the prebuilt app from the [latest release](https://github.com/alexey-a-abramov/macdirstat/releases/latest):
+
+- **`MacDirStat-<version>-macos.dmg`** — open it and drag `MacDirStat` onto the `Applications` shortcut.
+- **`MacDirStat-<version>-macos.zip`** — unzip and move `MacDirStat.app` into `/Applications` yourself.
+
+Both contain the same app (Apple Silicon). It's ad-hoc code-signed (not notarized), so on first launch right-click the app → **Open** once to let Gatekeeper through. To let it scan protected locations, add it under **System Settings → Privacy & Security → Full Disk Access**.
 
 ## Building
 
@@ -47,6 +52,16 @@ Full Disk Access**.
 
 Leave off `--install` to just build the bundle at `target/release/bundle/MacDirStat.app`
 without touching `/Applications`.
+
+### Build a disk image
+
+```sh
+./scripts/make-dmg.sh
+```
+
+Produces `target/release/bundle/MacDirStat-v<version>-macos.dmg` — the app next to
+an `Applications` symlink, so opening it gives the usual drag-to-install window.
+This is what the release workflow attaches to each tagged release.
 
 ## Usage
 

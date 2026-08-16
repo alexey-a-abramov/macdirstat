@@ -23,8 +23,15 @@ jobs:
           cd target/release/bundle
           zip -r -y "MacDirStat-${{ github.ref_name }}-macos.zip" MacDirStat.app
 
+      # Rebuilds the .app itself (a no-op cargo build here) so the script stays
+      # correct when run standalone; the DMG can never ship a stale bundle.
+      - name: Build the .dmg
+        run: ./scripts/make-dmg.sh "${{ github.ref_name }}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.zip
+          files: |
+            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.dmg
+            target/release/bundle/MacDirStat-${{ github.ref_name }}-macos.zip
           generate_release_notes: true
