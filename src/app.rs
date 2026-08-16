@@ -1739,10 +1739,11 @@ fn configure_about_panel_text() {
             info,
             set_sel,
             nsstring(
-                "Author: Michael Strömberg\n\
-                 \u{00A9} 2026 \u{2014} Licensed under GPL-3.0\n\n\
-                 github.com/MichaelStromberg/macdirstat\n\
-                 crates.io/crates/macdirstat",
+                "Based on MacDirStat by Michael Strömberg\n\
+                 github.com/MichaelStromberg/macdirstat\n\n\
+                 This fork is maintained by Alexey Abramov\n\
+                 github.com/alexey-a-abramov/macdirstat\n\n\
+                 \u{00A9} 2026 \u{2014} Licensed under GPL-3.0",
             ),
             nsstring("NSHumanReadableCopyright"),
         );

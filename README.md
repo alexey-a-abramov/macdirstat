@@ -4,7 +4,9 @@
 [![Security audit](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml/badge.svg?event=push&label=security%20audit)](https://github.com/alexey-a-abramov/macdirstat/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/alexey-a-abramov/macdirstat)](https://github.com/alexey-a-abramov/macdirstat/releases/latest)
 
-A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.net/) and [WizTree](https://diskanalyzer.com/). I loved the functionality of these tools but was never really satisfied with the alternatives available on macOS, so I built my own.
+A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.net/) and [WizTree](https://diskanalyzer.com/) — the tools that were never quite matched by the alternatives on macOS.
+
+This is a substantially extended fork of [MacDirStat](https://github.com/MichaelStromberg/macdirstat) by **Michael Strömberg**. It keeps the original's fast `getattrlistbulk` scanner and cushion-shaded treemap, and adds sunburst and largest-folder views, a sortable File Types browser with per-folder filtering, tree↔treemap synchronization, a persistent scan cache, configurable exclusions, stoppable scans, and packaged `.app`/`.dmg` builds. Ongoing development happens here.
 
 ## Features
 
@@ -20,7 +22,7 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 
 ## Screenshot
 
-<img src="https://github.com/MichaelStromberg/macdirstat/blob/main/screenshot.png?raw=true" alt="MacDirStat screenshot" width="750" />
+<img src="screenshot.png" alt="MacDirStat screenshot" width="750" />
 
 ## Download
 
@@ -112,6 +114,17 @@ advisories currently suppressed — both are Linux-only accessibility code paths
 compile into the macOS binary; each entry there links back to the
 `cargo tree` trace that proves it.
 
+## Credits
+
+MacDirStat was originally created by **[Michael Strömberg](https://github.com/MichaelStromberg)** —
+[MichaelStromberg/macdirstat](https://github.com/MichaelStromberg/macdirstat). The native
+`getattrlistbulk` scanner and the cushion-shaded treemap renderer are his work, and this fork would
+not exist without it.
+
+This fork is maintained by **[Alexey Abramov](https://github.com/alexey-a-abramov)** and has diverged
+substantially; issues and pull requests for it belong
+[here](https://github.com/alexey-a-abramov/macdirstat).
+
 ## License
 
-[GPL-3.0](LICENSE)
+[GPL-3.0](LICENSE) — same as the original.

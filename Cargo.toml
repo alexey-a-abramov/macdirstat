@@ -4,6 +4,10 @@ version = "0.5.1"
 edition = "2024"
 description = "fast windirstat clone for macos"
 license = "GPL-3.0"
+repository = "https://github.com/alexey-a-abramov/macdirstat"
+readme = "README.md"
+# Fork of https://github.com/MichaelStromberg/macdirstat by Michael Strömberg.
+authors = ["Michael Strömberg (original author)", "Alexey Abramov (fork)"]
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
